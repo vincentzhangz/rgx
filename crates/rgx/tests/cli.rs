@@ -17,9 +17,27 @@ fn run(args: &[&str]) -> (i32, String, String) {
     )
 }
 
+fn remove_all_retry(path: &Path) {
+    for attempt in 0..5 {
+        match fs::remove_dir_all(path) {
+            Ok(()) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::WouldBlock
+                ) && attempt + 1 < 5 =>
+            {
+                std::thread::sleep(std::time::Duration::from_millis(50 * (1 << attempt)));
+            }
+            Err(_) => return,
+        }
+    }
+}
+
 fn fixture(name: &str) -> PathBuf {
     let dir = std::env::temp_dir().join(format!("rgx-cli-test-{name}-{}", std::process::id()));
-    let _ = fs::remove_dir_all(&dir);
+    remove_all_retry(&dir);
     fs::create_dir_all(&dir).unwrap();
     dir
 }

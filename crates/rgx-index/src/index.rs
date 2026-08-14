@@ -319,7 +319,7 @@ fn write_index_files(
     progress: &mut dyn FnMut(&str),
 ) -> std::io::Result<u64> {
     let staging = PathBuf::from(format!("{}.tmp", index_dir.display()));
-    let _ = fs::remove_dir_all(&staging);
+    remove_dir_all_retry(&staging);
     fs::create_dir_all(&staging)?;
 
     let mut keys: Vec<u64> = postings.keys().copied().collect();
@@ -459,21 +459,75 @@ fn mtime_secs(meta: &fs::Metadata) -> u64 {
 /// Atomically swap the freshly built `staging` directory into place as
 /// `index_dir`. A crash at any point leaves either the previous index
 /// intact or no index at all (which is rebuilt on the next run) — never a
-/// partially written index.
+/// partially written index. The old index is moved to `<index_dir>.old`
+/// first so a failed swap can be rolled back.
+///
+/// This is robust on Windows, where renames and deletes under `%TEMP%` can
+/// transiently fail with `ERROR_ACCESS_DENIED` (notably on CI runners) and
+/// where a directory cannot be renamed over an existing directory
+/// (`MoveFileExW` limitation); transient failures are retried with backoff.
 fn publish_index(staging: &Path, index_dir: &Path) -> std::io::Result<()> {
     let stale = PathBuf::from(format!("{}.old", index_dir.display()));
-    let _ = fs::remove_dir_all(&stale);
-    if index_dir.exists() {
-        fs::rename(index_dir, &stale)?;
-    }
-    match fs::rename(staging, index_dir) {
-        Ok(()) => {
-            let _ = fs::remove_dir_all(&stale);
-            Ok(())
+    for attempt in 0..RETRY_ATTEMPTS {
+        remove_dir_all_retry(&stale);
+        if index_dir.exists() {
+            match fs::rename(index_dir, &stale) {
+                Ok(()) => {}
+                Err(e) if retryable(&e) && attempt + 1 < RETRY_ATTEMPTS => {
+                    transient_sleep(attempt);
+                    continue;
+                }
+                Err(e) => return Err(e),
+            }
         }
-        Err(e) => {
-            let _ = fs::rename(&stale, index_dir);
-            Err(e)
+        match fs::rename(staging, index_dir) {
+            Ok(()) => {
+                remove_dir_all_retry(&stale);
+                return Ok(());
+            }
+            Err(e) if retryable(&e) && attempt + 1 < RETRY_ATTEMPTS => {
+                let _ = fs::rename(&stale, index_dir);
+                transient_sleep(attempt);
+            }
+            Err(e) => {
+                let _ = fs::rename(&stale, index_dir);
+                return Err(e);
+            }
+        }
+    }
+    Err(std::io::Error::new(
+        std::io::ErrorKind::PermissionDenied,
+        "could not publish index directory",
+    ))
+}
+
+/// Number of attempts for a filesystem operation that may fail transiently.
+const RETRY_ATTEMPTS: u32 = 5;
+
+/// True for errors that may be transient on Windows (a file lock held by
+/// antivirus/indexing or a momentarily open handle), so a retry can succeed.
+fn retryable(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::WouldBlock
+    )
+}
+
+/// Short backoff between retries (50ms, 100ms, 200ms, ...).
+fn transient_sleep(attempt: u32) {
+    let ms = 50 * (1 << attempt.min(3));
+    std::thread::sleep(std::time::Duration::from_millis(ms));
+}
+
+/// Best-effort recursive delete that retries on transient Windows errors.
+/// Missing paths count as success (idempotent like `rm -rf`).
+pub(crate) fn remove_dir_all_retry(path: &Path) {
+    for attempt in 0..RETRY_ATTEMPTS {
+        match fs::remove_dir_all(path) {
+            Ok(()) => return,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+            Err(e) if retryable(&e) && attempt + 1 < RETRY_ATTEMPTS => transient_sleep(1),
+            Err(_) => return,
         }
     }
 }
@@ -720,7 +774,7 @@ mod tests {
     fn tmpdir(name: &str) -> PathBuf {
         let dir =
             std::env::temp_dir().join(format!("rgx-index-test-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        remove_dir_all_retry(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
     }

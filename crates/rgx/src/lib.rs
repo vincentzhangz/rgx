@@ -506,10 +506,28 @@ mod tests {
         assert_eq!(json_escape("line1\nline2"), "\"line1\\nline2\"");
     }
 
+    fn remove_all_retry(path: &std::path::Path) {
+        for attempt in 0..5 {
+            match std::fs::remove_dir_all(path) {
+                Ok(()) => return,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => return,
+                Err(e)
+                    if matches!(
+                        e.kind(),
+                        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::WouldBlock
+                    ) && attempt + 1 < 5 =>
+                {
+                    std::thread::sleep(std::time::Duration::from_millis(50 * (1 << attempt)));
+                }
+                Err(_) => return,
+            }
+        }
+    }
+
     fn search_index(name: &str, files: &[(&str, &str)]) -> Index {
         let root =
             std::env::temp_dir().join(format!("rgx-search-test-{name}-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&root);
+        remove_all_retry(&root);
         std::fs::create_dir_all(&root).unwrap();
         for (rel, content) in files {
             let p = root.join(rel);

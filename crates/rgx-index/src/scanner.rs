@@ -253,10 +253,11 @@ fn parse_gitignore_line(line: &str) -> Option<IgnorePattern> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::index::remove_dir_all_retry;
 
     fn tmpdir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("rgx-scan-test-{name}-{}", std::process::id()));
-        let _ = fs::remove_dir_all(&dir);
+        remove_dir_all_retry(&dir);
         fs::create_dir_all(&dir).unwrap();
         dir
     }
