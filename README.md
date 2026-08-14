@@ -23,8 +23,8 @@ candidates are read from disk, so search time scales with the number of
 - The index is ASCII case-folded, so case-insensitive queries (`-i`) prune
   correctly.
 - Corrupt or truncated indexes are detected at load time and reported as an
-  error (exit 2) instead of crashing; builds are written to a staging
-  directory and atomically swapped in.
+  error (exit 2) instead of crashing. First builds write the index in place;
+  rebuilds write to a staging directory and atomically swap it in.
 - `--update` is incremental: unchanged files are never re-read or re-indexed.
   A per-file n-gram cache (`grams.dat`), keyed by `(mtime, size, content
   hash)`, lets a mostly-unchanged repo update in a fraction of the time.

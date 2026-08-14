@@ -17,13 +17,6 @@ jobs:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, macos-latest, windows-latest]
-        include:
-          # Windows runners can spuriously fail directory renames/deletes in
-          # %TEMP% under parallel test load ("Access is denied", os error 5).
-          # Serializing tests there sidesteps the contention; the index build
-          # also retries transient failures on its own.
-          - os: windows-latest
-            nextest_args: --test-threads=1
     steps:
       - uses: actions/checkout@v4
 
@@ -44,7 +37,7 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Run tests (nextest)
-        run: cargo nextest run --workspace --profile ci ${{ matrix.nextest_args }}
+        run: cargo nextest run --workspace --profile ci
 
   coverage:
     name: coverage

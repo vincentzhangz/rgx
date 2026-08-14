@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Index builds no longer fail on Windows CI when antivirus holds a freshly
+  written staging file open: first builds write in place (no rename), and
+  rebuilds retry the atomic directory swap with a long backoff.
+- Removed the `--test-threads=1` workaround from the Windows CI matrix; the
+  underlying rename/delete contention is now handled by the index writer.
+
 ### Added
 
 - Initial `rgx` release: sparse n-gram indexed regex search over a source tree.

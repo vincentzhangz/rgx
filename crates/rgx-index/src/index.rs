@@ -22,6 +22,11 @@
 //! The keyed n-gram hash is `ngram_hash` (FNV-1a over the gram bytes).
 //! Hash collisions can only broaden a posting list, never cause a false
 //! negative, so no collision handling is required.
+//!
+//! Builds are safe against Windows antivirus locks: a first build writes the
+//! tables directly into `.rgx/` (no rename), while a rebuild stages the new
+//! tables in `.rgx.tmp/` and atomically swaps them in (retrying transient
+//! `ERROR_ACCESS_DENIED` renames with backoff).
 
 use crate::fingerprint::content_hash;
 use crate::ngram::{MIN_NGRAM_LENGTH, build_all_ngrams, ngram_hash};
@@ -309,8 +314,12 @@ fn accumulate(
     }
 }
 
-/// Write all five index files into a staging directory and atomically swap
-/// it into `index_dir`. Returns the total on-disk index size.
+/// Write the five index files for `index_dir`.
+///
+/// A first build (`index_dir` absent) writes the tables directly into place,
+/// avoiding the directory rename that Windows antivirus can block. Rebuilds
+/// stage the new tables in `<index_dir>.tmp` and atomically swap them in via
+/// [`publish_index`]. Returns the total on-disk index size.
 fn write_index_files(
     index_dir: &Path,
     postings: &HashMap<u64, Vec<u32>>,
@@ -318,14 +327,33 @@ fn write_index_files(
     grams: &[GramRecord],
     progress: &mut dyn FnMut(&str),
 ) -> std::io::Result<u64> {
+    progress("writing index files");
+
+    if !index_dir.exists() {
+        fs::create_dir_all(index_dir)?;
+        return write_tables(index_dir, postings, entries, grams);
+    }
+
     let staging = PathBuf::from(format!("{}.tmp", index_dir.display()));
     remove_dir_all_retry(&staging);
     fs::create_dir_all(&staging)?;
+    let index_bytes = write_tables(&staging, postings, entries, grams)?;
+    publish_index(&staging, index_dir)?;
+    Ok(index_bytes)
+}
 
+/// Write the five index data tables into `dir`. Returns the total on-disk
+/// index size.
+fn write_tables(
+    dir: &Path,
+    postings: &HashMap<u64, Vec<u32>>,
+    entries: &[FileEntry],
+    grams: &[GramRecord],
+) -> std::io::Result<u64> {
     let mut keys: Vec<u64> = postings.keys().copied().collect();
     keys.sort_unstable();
 
-    let mut pfile = File::create(staging.join("postings.dat"))?;
+    let mut pfile = File::create(dir.join("postings.dat"))?;
     pfile.write_all(POSTINGS_HEADER)?;
     pfile.write_all(&(keys.len() as u64).to_le_bytes())?;
     let total_ids: u64 = postings.values().map(|v| v.len() as u64).sum();
@@ -338,8 +366,9 @@ fn write_index_files(
         }
     }
     let postings_bytes = pfile.metadata()?.len();
+    drop(pfile);
 
-    let mut lfile = File::create(staging.join("lookup.dat"))?;
+    let mut lfile = File::create(dir.join("lookup.dat"))?;
     lfile.write_all(LOOKUP_HEADER)?;
     lfile.write_all(&(keys.len() as u64).to_le_bytes())?;
     let mut offset: u64 = POSTINGS_DATA_OFFSET;
@@ -350,20 +379,17 @@ fn write_index_files(
         offset += 4 + list.len() as u64 * 4;
     }
     let lookup_bytes = lfile.metadata()?.len();
+    drop(lfile);
 
-    write_path_table(staging.join("files.dat"), FILES_HEADER, entries)?;
-    write_meta_table(staging.join("meta.dat"), entries)?;
-    write_grams_table(staging.join("grams.dat"), grams)?;
+    write_path_table(dir.join("files.dat"), FILES_HEADER, entries)?;
+    write_meta_table(dir.join("meta.dat"), entries)?;
+    write_grams_table(dir.join("grams.dat"), grams)?;
 
-    let index_bytes = postings_bytes
+    Ok(postings_bytes
         + lookup_bytes
-        + fs::metadata(staging.join("files.dat"))?.len()
-        + fs::metadata(staging.join("meta.dat"))?.len()
-        + fs::metadata(staging.join("grams.dat"))?.len();
-
-    progress("writing index files");
-    publish_index(&staging, index_dir)?;
-    Ok(index_bytes)
+        + fs::metadata(dir.join("files.dat"))?.len()
+        + fs::metadata(dir.join("meta.dat"))?.len()
+        + fs::metadata(dir.join("grams.dat"))?.len())
 }
 
 fn write_path_table(path: PathBuf, magic: &[u8], entries: &[FileEntry]) -> std::io::Result<()> {
@@ -463,18 +489,20 @@ fn mtime_secs(meta: &fs::Metadata) -> u64 {
 /// first so a failed swap can be rolled back.
 ///
 /// This is robust on Windows, where renames and deletes under `%TEMP%` can
-/// transiently fail with `ERROR_ACCESS_DENIED` (notably on CI runners) and
-/// where a directory cannot be renamed over an existing directory
-/// (`MoveFileExW` limitation); transient failures are retried with backoff.
+/// fail with `ERROR_ACCESS_DENIED` while antivirus holds a freshly written
+/// file open (notably on CI runners) and where a directory cannot be renamed
+/// over an existing directory (`MoveFileExW` limitation); transient failures
+/// are retried with a long backoff, since the lock can persist for seconds.
+/// On Unix the swap is POSIX-atomic, so a single attempt suffices.
 fn publish_index(staging: &Path, index_dir: &Path) -> std::io::Result<()> {
     let stale = PathBuf::from(format!("{}.old", index_dir.display()));
-    for attempt in 0..RETRY_ATTEMPTS {
+    for attempt in 0..PUBLISH_ATTEMPTS {
         remove_dir_all_retry(&stale);
         if index_dir.exists() {
             match fs::rename(index_dir, &stale) {
                 Ok(()) => {}
-                Err(e) if retryable(&e) && attempt + 1 < RETRY_ATTEMPTS => {
-                    transient_sleep(attempt);
+                Err(e) if retryable(&e) && attempt + 1 < PUBLISH_ATTEMPTS => {
+                    publish_sleep(attempt);
                     continue;
                 }
                 Err(e) => return Err(e),
@@ -485,9 +513,9 @@ fn publish_index(staging: &Path, index_dir: &Path) -> std::io::Result<()> {
                 remove_dir_all_retry(&stale);
                 return Ok(());
             }
-            Err(e) if retryable(&e) && attempt + 1 < RETRY_ATTEMPTS => {
+            Err(e) if retryable(&e) && attempt + 1 < PUBLISH_ATTEMPTS => {
                 let _ = fs::rename(&stale, index_dir);
-                transient_sleep(attempt);
+                publish_sleep(attempt);
             }
             Err(e) => {
                 let _ = fs::rename(&stale, index_dir);
@@ -501,19 +529,47 @@ fn publish_index(staging: &Path, index_dir: &Path) -> std::io::Result<()> {
     ))
 }
 
+/// Number of attempts to atomically publish a rebuilt index directory.
+/// Windows retries because antivirus can hold a freshly written index open
+/// for seconds; Unix needs no retry.
+#[cfg(windows)]
+const PUBLISH_ATTEMPTS: u32 = 6;
+#[cfg(not(windows))]
+const PUBLISH_ATTEMPTS: u32 = 1;
+
 /// Number of attempts for a filesystem operation that may fail transiently.
 const RETRY_ATTEMPTS: u32 = 5;
 
 /// True for errors that may be transient on Windows (a file lock held by
 /// antivirus/indexing or a momentarily open handle), so a retry can succeed.
+#[cfg(windows)]
 fn retryable(e: &std::io::Error) -> bool {
     matches!(
-        e.kind(),
-        std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::WouldBlock
+        e.raw_os_error(),
+        Some(
+            5 /* ERROR_ACCESS_DENIED */
+                | 32 /* ERROR_SHARING_VIOLATION */
+                | 33 /* ERROR_LOCK_VIOLATION */
+        )
     )
 }
 
-/// Short backoff between retries (50ms, 100ms, 200ms, ...).
+#[cfg(not(windows))]
+fn retryable(_e: &std::io::Error) -> bool {
+    false
+}
+
+/// Backoff between index-publish retries: 1s, 2s, 4s, 8s, ...
+#[cfg(windows)]
+fn publish_sleep(attempt: u32) {
+    let ms = 1000 << attempt.min(3);
+    std::thread::sleep(std::time::Duration::from_millis(ms));
+}
+
+#[cfg(not(windows))]
+fn publish_sleep(_attempt: u32) {}
+
+/// Short backoff between cleanup retries (50ms, 100ms, 200ms, ...).
 fn transient_sleep(attempt: u32) {
     let ms = 50 * (1 << attempt.min(3));
     std::thread::sleep(std::time::Duration::from_millis(ms));
