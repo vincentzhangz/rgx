@@ -1,0 +1,8 @@
+[profile.default]
+# Tests are self-contained (per-test temp dirs, no shared state), so nextest's
+# per-process isolation and parallel execution are safe as-is.
+
+[profile.ci]
+fail-fast = true
+retries = 0
+slow-timeout = { period = "120s", terminate-after = 2 }

@@ -1,0 +1,34 @@
+[workspace]
+resolver = "2"
+members = ["crates/rgx", "crates/rgx-index", "crates/rgx-query"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.97"
+license = "MIT"
+authors = ["Vincent"]
+repository = "https://github.com/vincentzhangz/rgx"
+homepage = "https://github.com/vincentzhangz/rgx"
+keywords = ["regex", "search", "index", "ngram", "grep"]
+categories = ["command-line-utilities", "text-processing"]
+readme = "README.md"
+
+[workspace.dependencies]
+memmap2 = "0.9.11"
+regex = "1.13.1"
+regex-syntax = "0.8.11"
+
+[workspace.metadata.release]
+shared-version = true
+tag-name = "v{{version}}"
+publish = false
+pre-release-replacements = [
+    { file = "CHANGELOG.md", search = "## [Unreleased]", replace = "## [Unreleased]\n\n## [{{version}}]", exactly = 1, prerelease = false },
+]
+
+[profile.release]
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true

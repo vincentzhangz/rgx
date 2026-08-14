@@ -1,0 +1,16 @@
+# Rust build artifacts
+/target/
+
+# Indexes and benchmark scratch data
+/.rgx/
+/rgx-corpus/
+
+# Coverage reports
+/coverage.*
+/coverage/
+
+# Editor and OS noise
+.DS_Store
+.idea/
+.vscode/
+*.swp

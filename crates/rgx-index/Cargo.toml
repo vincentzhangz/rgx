@@ -1,0 +1,16 @@
+[package]
+name = "rgx-index"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Sparse n-gram inverted index for fast regex search (Cursor paper)"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+include = ["src/**"]
+
+[dependencies]
+memmap2 = { workspace = true }
+regex = { workspace = true }

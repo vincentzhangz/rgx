@@ -1,0 +1,150 @@
+# rgx
+
+Fast indexed regex search, in Rust.
+
+`rgx` builds a sparse n-gram index over your source tree once, then answers
+regex queries in milliseconds — even on very large codebases. It implements
+the sparse n-gram algorithm from Cursor's ["fast regex search"][paper] blog
+post, rewritten from scratch against `regex`/`regex-syntax`.
+
+[paper]: https://cursor.com/blog/fast-regex-search
+
+## Why it's fast
+
+The index stores postings for only the most selective n-grams of every file
+(≤ 2n−2 grams per file). A query is decomposed into a covering set of n-grams
+(≤ n−2, max length 16); the candidate set is computed with an intersection of
+prefix grams and suffix grams, then verified exactly with `regex`. Only
+candidates are read from disk, so search time scales with the number of
+*matching* files — not the size of the tree.
+
+- Hash-only keys are sound: a hash collision only widens the candidate set;
+  verification is always exact.
+- The index is ASCII case-folded, so case-insensitive queries (`-i`) prune
+  correctly.
+- Corrupt or truncated indexes are detected at load time and reported as an
+  error (exit 2) instead of crashing; builds are written to a staging
+  directory and atomically swapped in.
+- `--update` is incremental: unchanged files are never re-read or re-indexed.
+  A per-file n-gram cache (`grams.dat`), keyed by `(mtime, size, content
+  hash)`, lets a mostly-unchanged repo update in a fraction of the time.
+
+## Usage
+
+```
+rgx [OPTIONS] <PATTERN> [PATH]
+
+OPTIONS:
+    -h, --help         Print help
+    -i, --ignore-case  Case-insensitive search
+        --build        (Re)build the index before searching
+        --update       Incrementally update the index (only changed files
+                       are re-read; falls back to a full rebuild if needed)
+        --no-index     Search without using the index (brute force)
+        --stats        Print index statistics
+        --time         Print timing breakdown
+        --json         Emit JSON Lines with submatch byte offsets
+        --follow       Follow symbolic links while scanning
+
+EXIT CODES:
+    0   matches found
+    1   no matches
+    2   error
+```
+
+The index is stored in `.rgx/` at the search root and is built automatically
+on first use. Hidden files and directories, `node_modules`, `.gitignore`d
+paths, and binary files are skipped while scanning.
+
+Example:
+
+```console
+$ rgx "fn main" .
+src/main.rs:4:fn main() {
+```
+
+JSON output reports submatch byte offsets:
+
+```console
+$ rgx --json "hello|world" . | head -1
+{"path":"./src/main.rs","line_number":2,"line":"    let s = \"hello world\";","submatches":[{"start":12,"end":17},{"start":18,"end":23}]}
+```
+
+## Install
+
+```console
+$ cargo install --path crates/rgx
+```
+
+Requires Rust 1.97+ (edition 2024).
+
+## Use as a library
+
+All three crates are library-first; depend on them from Git (no crates.io
+publish yet). `crates/rgx` bundles the index, query planner, matcher, and a
+one-call search API; use `rgx-index` + `rgx-query` directly if you want the
+pieces separately.
+
+```toml
+[dependencies]
+rgx = { git = "https://github.com/vincentzhangz/rgx", branch = "main" }
+# or, to use the layers individually:
+# rgx-index = { git = "https://github.com/vincentzhangz/rgx", branch = "main" }
+# rgx-query = { git = "https://github.com/vincentzhangz/rgx", branch = "main" }
+```
+
+```rust,no_run
+use rgx::search;
+use rgx_index::{Index, ScanOptions, build_index};
+
+let root = std::path::Path::new("/path/to/code");
+let index_dir = root.join(".rgx");
+let mut progress = |p: &str| println!("indexing {p}");
+build_index(root, &index_dir, &ScanOptions::default(), &mut progress)?;
+
+let index = Index::open(&index_dir)?;
+let matches = search(&index, "fn [a-z_]+\\(", false)?;
+for m in &matches {
+    println!("{}:{}: {}", m.path, m.line, m.line_text.trim());
+}
+# Ok::<(), Box<dyn std::error::Error>>(())
+```
+
+Search results are the same `Match` type the CLI prints: path, 1-based line
+number, the line text, and submatch byte offsets when a match is JSON-typed.
+
+## Development
+
+```console
+$ cargo test --workspace          # unit + integration tests
+$ cargo nextest run --workspace   # parallel test runner (recommended)
+$ cargo clippy --all-targets -- -D warnings
+$ cargo fmt --check
+$ ./scripts/coverage.sh           # HTML + LCOV report into target/coverage
+$ ./scripts/bench.sh              # rgx vs ripgrep on a synthetic corpus
+```
+
+Coverage is a developer aid and is never gated in CI.
+
+## Workspace layout
+
+- `crates/rgx` — CLI (`rgx::execute`), matcher, JSON output.
+- `crates/rgx-index` — scanner (hidden/`.gitignore`/binary policies),
+  n-gram algorithm, on-disk index format, atomic build.
+- `crates/rgx-query` — query decomposition, candidate planning, set algebra.
+
+## Index format
+
+Five files under `.rgx/`, all little-endian, versioned by magic bytes:
+
+| file         | contents                                                        |
+|--------------|-----------------------------------------------------------------|
+| `lookup.dat` | header + sorted `(hash u64, postings-offset u64)` entries        |
+| `postings.dat`| header + length-prefixed sorted `u32` file-id lists              |
+| `files.dat`  | header + length-prefixed file paths (index == file id)           |
+| `meta.dat`   | header + per-file `(path, mtime, size)` for change detection     |
+| `grams.dat`  | header + per-file `(path, mtime, size, content-hash, grams)` cache for incremental updates |
+
+## License
+
+MIT. See [LICENSE](LICENSE).

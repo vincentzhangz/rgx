@@ -1,0 +1,16 @@
+[package]
+name = "rgx-query"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+description = "Regex decomposition into sparse n-gram queries for rgx"
+repository.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme.workspace = true
+include = ["src/**"]
+
+[dependencies]
+regex-syntax = { workspace = true }
+rgx-index = { version = "0.1.0", path = "../rgx-index" }
