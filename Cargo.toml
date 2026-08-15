@@ -15,6 +15,7 @@ categories = ["command-line-utilities", "text-processing"]
 readme = "README.md"
 
 [workspace.dependencies]
+ignore = "0.4.23"
 memmap2 = "0.9.11"
 regex = "1.13.1"
 regex-syntax = "0.8.11"

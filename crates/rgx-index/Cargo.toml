@@ -12,5 +12,6 @@ readme.workspace = true
 include = ["src/**"]
 
 [dependencies]
+ignore = { workspace = true }
 memmap2 = { workspace = true }
 regex = { workspace = true }

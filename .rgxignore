@@ -1,0 +1,7 @@
+# Custom patterns to ignore during rgx indexing (in addition to .gitignore)
+target/
+.git/
+.rgx/
+coverage/
+*.profraw
+*.lcov

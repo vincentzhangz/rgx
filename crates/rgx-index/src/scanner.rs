@@ -1,12 +1,12 @@
-//! Recursive file scanner with hidden-file, ignore-pattern and binary-file
-//! support. Written from scratch (no `walkdir`/`ignore` dependency).
+//! Recursive file scanner using the `ignore` crate (ripgrep ecosystem).
 //!
-//! Behavior follows `rg` conventions: hidden files and directories (names
-//! starting with `.`) are skipped unless explicitly named, symbolic links
-//! are not followed by default, and files detected as binary (by extension
-//! or a null byte in the first 512 bytes) are never indexed.
+//! Behavior follows `rg` conventions: respects root and nested `.gitignore` files,
+//! `.rgxignore` files, global gitignore, skips hidden files/directories (names
+//! starting with `.`), skips non-followed symlinks, and skips files detected as
+//! binary (by extension or a null byte in the first 512 bytes).
 
-use std::collections::HashSet;
+use ignore::WalkBuilder;
+use ignore::overrides::OverrideBuilder;
 use std::fs;
 use std::path::{Path, PathBuf};
 
@@ -30,7 +30,7 @@ const BINARY_EXTENSIONS: &[&str] = &[
     "png", "jpg", "jpeg", "gif", "bmp", "ico", "svg", "woff", "woff2", "ttf", "eot", "mp3", "mp4",
     "avi", "mov", "pdf", "zip", "tar", "gz", "bz2", "xz", "7z", "rar", "exe", "dll", "so", "dylib",
     "o", "a", "beam", "class", "jar", "war", "pyc", "pyo", "DS_Store", "lock", "node", "wasm",
-    "bin", "obj", "pyc", "db", "sqlite", "sqlite3", "log",
+    "bin", "obj", "db", "sqlite", "sqlite3", "log",
 ];
 
 /// Default maximum indexed file size (bytes).
@@ -57,11 +57,48 @@ impl Default for ScanOptions {
 /// Walk `root` and return the list of indexable file paths, sorted.
 pub fn scan(root: &Path, opts: &ScanOptions) -> Vec<PathBuf> {
     let root = display_root(root);
-    let gitignore = Gitignore::load(root.as_path());
+
+    let mut ov_builder = OverrideBuilder::new(&root);
+    for dir in DEFAULT_IGNORED_DIRS {
+        let _ = ov_builder.add(&format!("!{dir}"));
+        let _ = ov_builder.add(&format!("!{dir}/**"));
+        let _ = ov_builder.add(&format!("!**/{dir}"));
+        let _ = ov_builder.add(&format!("!**/{dir}/**"));
+    }
+    let overrides = ov_builder
+        .build()
+        .unwrap_or(ignore::overrides::Override::empty());
+
+    let mut builder = WalkBuilder::new(&root);
+    builder
+        .hidden(true)
+        .parents(true)
+        .git_ignore(true)
+        .git_global(true)
+        .git_exclude(true)
+        .require_git(false)
+        .follow_links(opts.follow_symlinks)
+        .max_filesize(Some(opts.max_file_size))
+        .overrides(overrides)
+        .add_custom_ignore_filename(".rgxignore");
 
     let mut files = Vec::new();
-    let mut visited = HashSet::new();
-    walk(&root, &root, opts, &gitignore, &mut visited, &mut files);
+    for result in builder.build() {
+        let entry = match result {
+            Ok(e) => e,
+            Err(_) => continue,
+        };
+        let path = entry.path();
+        let file_type = match entry.file_type() {
+            Some(ft) => ft,
+            None => continue,
+        };
+        if (file_type.is_file() || (opts.follow_symlinks && file_type.is_symlink()))
+            && indexable_file(path, opts)
+        {
+            files.push(path.to_path_buf());
+        }
+    }
     files.sort();
     files
 }
@@ -86,59 +123,6 @@ pub fn display_root(root: &Path) -> PathBuf {
     canon
 }
 
-fn walk(
-    root: &Path,
-    dir: &Path,
-    opts: &ScanOptions,
-    gitignore: &Gitignore,
-    visited: &mut HashSet<PathBuf>,
-    out: &mut Vec<PathBuf>,
-) {
-    if dir != root && is_hidden(dir) {
-        return;
-    }
-    if dir != root && is_ignored_dir(dir) {
-        return;
-    }
-    if opts.follow_symlinks
-        && let Ok(canon) = dir.canonicalize()
-        && !visited.insert(canon)
-    {
-        return;
-    }
-
-    let entries = match fs::read_dir(dir) {
-        Ok(e) => e,
-        Err(_) => return,
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        let file_type = match entry.file_type() {
-            Ok(t) => t,
-            Err(_) => continue,
-        };
-        let is_dir = if file_type.is_dir() {
-            true
-        } else if opts.follow_symlinks && file_type.is_symlink() {
-            fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false)
-        } else {
-            false
-        };
-        let is_file = if file_type.is_file() {
-            true
-        } else if opts.follow_symlinks && file_type.is_symlink() {
-            fs::metadata(&path).map(|m| m.is_file()).unwrap_or(false)
-        } else {
-            false
-        };
-        if is_dir {
-            walk(root, &path, opts, gitignore, visited, out);
-        } else if is_file && indexable_file(&path, opts, gitignore) {
-            out.push(path);
-        }
-    }
-}
-
 fn is_hidden(path: &Path) -> bool {
     path.file_name()
         .and_then(|n| n.to_str())
@@ -146,21 +130,13 @@ fn is_hidden(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn is_ignored_dir(path: &Path) -> bool {
-    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
-    DEFAULT_IGNORED_DIRS.contains(&name)
-}
-
-fn indexable_file(path: &Path, opts: &ScanOptions, gitignore: &Gitignore) -> bool {
+fn indexable_file(path: &Path, opts: &ScanOptions) -> bool {
     if is_hidden(path) {
         return false;
     }
     if let Some(ext) = path.extension().and_then(|e| e.to_str())
         && BINARY_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
     {
-        return false;
-    }
-    if gitignore.is_ignored(path) {
         return false;
     }
     match fs::metadata(path) {
@@ -184,90 +160,6 @@ fn contains_nul_byte(path: &Path) -> bool {
     let mut f = f;
     let n = f.read(&mut buf).unwrap_or(0);
     buf[..n].contains(&0)
-}
-
-struct Gitignore {
-    patterns: Vec<IgnorePattern>,
-    root: PathBuf,
-}
-
-struct IgnorePattern {
-    regex: String,
-    /// Whether the pattern is anchored to the gitignore root.
-    anchored: bool,
-}
-
-impl Gitignore {
-    fn load(root: &Path) -> Gitignore {
-        let gitignore_path = root.join(".gitignore");
-        let mut patterns = Vec::new();
-        if let Ok(content) = fs::read_to_string(&gitignore_path) {
-            for line in content.lines() {
-                let line = line.trim();
-                if line.is_empty() || line.starts_with('#') {
-                    continue;
-                }
-                if let Some(p) = parse_gitignore_line(line) {
-                    patterns.push(p);
-                }
-            }
-        }
-        Gitignore {
-            patterns,
-            root: root.to_path_buf(),
-        }
-    }
-
-    fn is_ignored(&self, path: &Path) -> bool {
-        let rel = match path.strip_prefix(&self.root) {
-            Ok(r) => r,
-            Err(_) => return false,
-        };
-        let rel_str = rel.to_string_lossy();
-        self.patterns.iter().any(|p| {
-            if p.anchored {
-                rel_str.starts_with(&p.regex)
-            } else {
-                rel_str.contains(&p.regex)
-            }
-        })
-    }
-}
-
-/// Translate a `.gitignore` glob into a simple matcher string.
-///
-/// Full gitignore semantics are complex; this covers the common cases
-/// (names, `dir/`, `*.ext`, `name/`, leading `/`, trailing `/`).
-fn parse_gitignore_line(line: &str) -> Option<IgnorePattern> {
-    let mut s = line.to_string();
-    let anchored = if let Some(stripped) = s.strip_prefix('/') {
-        s = stripped.to_string();
-        true
-    } else {
-        false
-    };
-
-    if let Some(stripped) = s.strip_suffix('/') {
-        s = stripped.to_string();
-    }
-
-    let token = if s.starts_with('*') {
-        s.trim_start_matches('*')
-    } else if s.contains('*') || s.contains('?') {
-        let cut = s.find(['*', '?']).unwrap_or(s.len());
-        &s[..cut]
-    } else {
-        s.as_str()
-    };
-
-    if token.is_empty() {
-        return None;
-    }
-
-    Some(IgnorePattern {
-        regex: token.to_string(),
-        anchored: anchored || !token.contains('/'),
-    })
 }
 
 #[cfg(test)]
@@ -336,5 +228,48 @@ mod tests {
         assert!(files.iter().any(|p| p.ends_with("keep.txt")));
         assert!(!files.iter().any(|p| p.ends_with("ignored.txt")));
         assert!(!files.iter().any(|p| p.ends_with("inner.txt")));
+    }
+
+    #[test]
+    fn nested_gitignore_and_negations() {
+        let root = tmpdir("nested-git");
+        fs::write(root.join(".gitignore"), "*.bak\n!important.bak\n").unwrap();
+        fs::write(root.join("test.bak"), "drop").unwrap();
+        fs::write(root.join("important.bak"), "keep").unwrap();
+
+        fs::create_dir_all(root.join("subpkg")).unwrap();
+        fs::write(root.join("subpkg/.gitignore"), "sub_ignored.txt\n").unwrap();
+        fs::write(root.join("subpkg/sub_ignored.txt"), "drop").unwrap();
+        fs::write(root.join("subpkg/sub_keep.txt"), "keep").unwrap();
+
+        let files = scan(&root, &ScanOptions::default());
+        assert!(
+            files.iter().any(|p| p.ends_with("important.bak")),
+            "negated pattern must be kept"
+        );
+        assert!(
+            !files.iter().any(|p| p.ends_with("test.bak")),
+            "bak must be ignored"
+        );
+        assert!(
+            !files.iter().any(|p| p.ends_with("sub_ignored.txt")),
+            "nested ignore must be respected"
+        );
+        assert!(
+            files.iter().any(|p| p.ends_with("sub_keep.txt")),
+            "nested keep must be included"
+        );
+    }
+
+    #[test]
+    fn rgxignore_respected() {
+        let root = tmpdir("rgxignore");
+        fs::write(root.join(".rgxignore"), "custom_skip.txt\n").unwrap();
+        fs::write(root.join("custom_skip.txt"), "drop").unwrap();
+        fs::write(root.join("keep.txt"), "keep").unwrap();
+
+        let files = scan(&root, &ScanOptions::default());
+        assert!(files.iter().any(|p| p.ends_with("keep.txt")));
+        assert!(!files.iter().any(|p| p.ends_with("custom_skip.txt")));
     }
 }

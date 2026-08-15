@@ -18,6 +18,15 @@ prefix grams and suffix grams, then verified exactly with `regex`. Only
 candidates are read from disk, so search time scales with the number of
 *matching* files — not the size of the tree.
 
+- **Parallel by default**: Both query verification and index construction /
+  updating use standard library `std::thread::scope` for multi-threaded
+  concurrency without binding to any runtime.
+- **High-throughput buffered I/O**: Index tables (`lookup.dat`, `postings.dat`,
+  `files.dat`, `meta.dat`, `grams.dat`) are written via 64 KB `BufWriter`s and
+  read via memory mapping (`mmap`).
+- **Production file discovery**: Powered by the `ignore` crate (ripgrep ecosystem),
+  supporting root and nested `.gitignore` files, glob negations (`!pattern`),
+  `.git/info/exclude`, and custom `.rgxignore` files.
 - Hash-only keys are sound: a hash collision only widens the candidate set;
   verification is always exact.
 - The index is ASCII case-folded, so case-insensitive queries (`-i`) prune
@@ -53,8 +62,10 @@ EXIT CODES:
 ```
 
 The index is stored in `.rgx/` at the search root and is built automatically
-on first use. Hidden files and directories, `node_modules`, `.gitignore`d
-paths, and binary files are skipped while scanning.
+on first use. Hidden files and directories, default build artifacts (`node_modules`,
+`target`, `vendor`, `dist`, `build`, etc.), `.gitignore` rules (including nested
+and negated patterns), custom `.rgxignore` files, and binary files are skipped
+while scanning.
 
 Example:
 

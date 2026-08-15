@@ -57,6 +57,9 @@ const ENTRY_LEN: usize = 16;
 /// starts 8 bytes later than the generic 16-byte header.
 const POSTINGS_DATA_OFFSET: u64 = (HEADER_LEN + 8) as u64;
 
+/// Buffer capacity for writing index files (64 KB).
+const INDEX_WRITE_BUF_CAPACITY: usize = 64 * 1024;
+
 /// A file known to the index.
 #[derive(Clone, Debug)]
 pub struct FileEntry {
@@ -103,6 +106,13 @@ pub struct BuildStats {
     pub reused_files: usize,
 }
 
+struct ProcessedFile {
+    entry: FileEntry,
+    record: GramRecord,
+    bytes_read: u64,
+    reused: bool,
+}
+
 /// Build an index for the tree at `root` into `index_dir` (usually
 /// `root/.rgx`). `progress` is invoked with human-readable status lines.
 pub fn build_index(
@@ -116,39 +126,82 @@ pub fn build_index(
     let n = files.len();
     progress(&format!("scanning: {} files", n));
 
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .max(1);
+
+    let processed_chunks: Vec<Vec<ProcessedFile>> = if files.is_empty() {
+        Vec::new()
+    } else {
+        let chunk_size = files.len().div_ceil(threads).max(1);
+        std::thread::scope(|s| {
+            let handles: Vec<_> = files
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    s.spawn(move || {
+                        let mut out = Vec::with_capacity(chunk.len());
+                        for path in chunk {
+                            let meta = match fs::metadata(path) {
+                                Ok(m) => m,
+                                Err(_) => continue,
+                            };
+                            let mtime = mtime_secs(&meta);
+                            let size = meta.len();
+                            let content = match fs::read(path) {
+                                Ok(c) => c,
+                                Err(_) => continue,
+                            };
+                            let bytes_read = content.len() as u64;
+                            let record = GramRecord {
+                                path: path.clone(),
+                                mtime,
+                                size,
+                                content_hash: content_hash(&content),
+                                grams: file_grams(&content),
+                            };
+                            let entry = FileEntry {
+                                path: path.clone(),
+                                mtime,
+                                size,
+                            };
+                            out.push(ProcessedFile {
+                                entry,
+                                record,
+                                bytes_read,
+                                reused: false,
+                            });
+                        }
+                        out
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_default())
+                .collect()
+        })
+    };
+
     let mut postings: HashMap<u64, Vec<u32>> = HashMap::new();
     let mut entries: Vec<FileEntry> = Vec::with_capacity(n);
     let mut grams: Vec<GramRecord> = Vec::with_capacity(n);
     let mut total_postings: u64 = 0;
     let mut bytes_read: u64 = 0;
 
-    for (id, path) in files.iter().enumerate() {
-        let meta = match fs::metadata(path) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let mtime = mtime_secs(&meta);
-        let size = meta.len();
-        let content = match fs::read(path) {
-            Ok(c) => c,
-            Err(_) => continue,
-        };
-        bytes_read += content.len() as u64;
-
-        let record = GramRecord {
-            path: path.clone(),
-            mtime,
-            size,
-            content_hash: content_hash(&content),
-            grams: file_grams(&content),
-        };
-        accumulate(&mut postings, &mut total_postings, id as u32, &record.grams);
-        entries.push(FileEntry {
-            path: path.clone(),
-            mtime,
-            size,
-        });
-        grams.push(record);
+    for chunk in processed_chunks {
+        for processed in chunk {
+            let id = entries.len() as u32;
+            bytes_read += processed.bytes_read;
+            accumulate(
+                &mut postings,
+                &mut total_postings,
+                id,
+                &processed.record.grams,
+            );
+            entries.push(processed.entry);
+            grams.push(processed.record);
+        }
     }
 
     let index_bytes = write_index_files(index_dir, &postings, &entries, &grams, progress)?;
@@ -193,6 +246,111 @@ pub fn update_index(
         old_by_path.insert(g.path.clone(), g);
     }
 
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .max(1);
+
+    let processed_chunks: Vec<Vec<ProcessedFile>> = if files.is_empty() {
+        Vec::new()
+    } else {
+        let chunk_size = files.len().div_ceil(threads).max(1);
+        std::thread::scope(|s| {
+            let handles: Vec<_> = files
+                .chunks(chunk_size)
+                .map(|chunk| {
+                    let old_by_path = &old_by_path;
+                    s.spawn(move || {
+                        let mut out = Vec::with_capacity(chunk.len());
+                        for path in chunk {
+                            let meta = match fs::metadata(path) {
+                                Ok(m) => m,
+                                Err(_) => continue,
+                            };
+                            let mtime = mtime_secs(&meta);
+                            let size = meta.len();
+
+                            let cached = old_by_path.get(path);
+                            let (record, bytes_read, reused) = match cached {
+                                Some(c) if c.mtime == mtime && c.size == size => {
+                                    (c.clone(), 0u64, true)
+                                }
+                                Some(c) => {
+                                    let content = match fs::read(path) {
+                                        Ok(c) => c,
+                                        Err(_) => continue,
+                                    };
+                                    let bytes = content.len() as u64;
+                                    let hash = content_hash(&content);
+                                    if hash == c.content_hash {
+                                        (
+                                            GramRecord {
+                                                path: path.clone(),
+                                                mtime,
+                                                size,
+                                                content_hash: hash,
+                                                grams: c.grams.clone(),
+                                            },
+                                            bytes,
+                                            true,
+                                        )
+                                    } else {
+                                        (
+                                            GramRecord {
+                                                path: path.clone(),
+                                                mtime,
+                                                size,
+                                                content_hash: hash,
+                                                grams: file_grams(&content),
+                                            },
+                                            bytes,
+                                            false,
+                                        )
+                                    }
+                                }
+                                None => {
+                                    let content = match fs::read(path) {
+                                        Ok(c) => c,
+                                        Err(_) => continue,
+                                    };
+                                    let bytes = content.len() as u64;
+                                    (
+                                        GramRecord {
+                                            path: path.clone(),
+                                            mtime,
+                                            size,
+                                            content_hash: content_hash(&content),
+                                            grams: file_grams(&content),
+                                        },
+                                        bytes,
+                                        false,
+                                    )
+                                }
+                            };
+
+                            let entry = FileEntry {
+                                path: path.clone(),
+                                mtime,
+                                size,
+                            };
+                            out.push(ProcessedFile {
+                                entry,
+                                record,
+                                bytes_read,
+                                reused,
+                            });
+                        }
+                        out
+                    })
+                })
+                .collect();
+            handles
+                .into_iter()
+                .map(|h| h.join().unwrap_or_default())
+                .collect()
+        })
+    };
+
     let mut postings: HashMap<u64, Vec<u32>> = HashMap::new();
     let mut entries: Vec<FileEntry> = Vec::with_capacity(n);
     let mut grams: Vec<GramRecord> = Vec::with_capacity(n);
@@ -200,65 +358,22 @@ pub fn update_index(
     let mut bytes_read: u64 = 0;
     let mut reused: usize = 0;
 
-    for (id, path) in files.iter().enumerate() {
-        let meta = match fs::metadata(path) {
-            Ok(m) => m,
-            Err(_) => continue,
-        };
-        let mtime = mtime_secs(&meta);
-        let size = meta.len();
-
-        let cached = old_by_path.remove(path);
-        let mut record = match cached {
-            Some(c) if c.mtime == mtime && c.size == size => {
+    for chunk in processed_chunks {
+        for processed in chunk {
+            let id = entries.len() as u32;
+            if processed.reused {
                 reused += 1;
-                c
             }
-            Some(c) => {
-                let content = match fs::read(path) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-                bytes_read += content.len() as u64;
-                let hash = content_hash(&content);
-                if hash == c.content_hash {
-                    reused += 1;
-                    c
-                } else {
-                    GramRecord {
-                        path: path.clone(),
-                        mtime,
-                        size,
-                        content_hash: hash,
-                        grams: file_grams(&content),
-                    }
-                }
-            }
-            None => {
-                let content = match fs::read(path) {
-                    Ok(c) => c,
-                    Err(_) => continue,
-                };
-                bytes_read += content.len() as u64;
-                GramRecord {
-                    path: path.clone(),
-                    mtime,
-                    size,
-                    content_hash: content_hash(&content),
-                    grams: file_grams(&content),
-                }
-            }
-        };
-        record.mtime = mtime;
-        record.size = size;
-
-        accumulate(&mut postings, &mut total_postings, id as u32, &record.grams);
-        entries.push(FileEntry {
-            path: path.clone(),
-            mtime,
-            size,
-        });
-        grams.push(record);
+            bytes_read += processed.bytes_read;
+            accumulate(
+                &mut postings,
+                &mut total_postings,
+                id,
+                &processed.record.grams,
+            );
+            entries.push(processed.entry);
+            grams.push(processed.record);
+        }
     }
 
     progress(&format!(
@@ -353,7 +468,10 @@ fn write_tables(
     let mut keys: Vec<u64> = postings.keys().copied().collect();
     keys.sort_unstable();
 
-    let mut pfile = File::create(dir.join("postings.dat"))?;
+    let mut pfile = std::io::BufWriter::with_capacity(
+        INDEX_WRITE_BUF_CAPACITY,
+        File::create(dir.join("postings.dat"))?,
+    );
     pfile.write_all(POSTINGS_HEADER)?;
     pfile.write_all(&(keys.len() as u64).to_le_bytes())?;
     let total_ids: u64 = postings.values().map(|v| v.len() as u64).sum();
@@ -365,10 +483,14 @@ fn write_tables(
             pfile.write_all(&id.to_le_bytes())?;
         }
     }
-    let postings_bytes = pfile.metadata()?.len();
+    pfile.flush()?;
+    let postings_bytes = pfile.get_ref().metadata()?.len();
     drop(pfile);
 
-    let mut lfile = File::create(dir.join("lookup.dat"))?;
+    let mut lfile = std::io::BufWriter::with_capacity(
+        INDEX_WRITE_BUF_CAPACITY,
+        File::create(dir.join("lookup.dat"))?,
+    );
     lfile.write_all(LOOKUP_HEADER)?;
     lfile.write_all(&(keys.len() as u64).to_le_bytes())?;
     let mut offset: u64 = POSTINGS_DATA_OFFSET;
@@ -378,7 +500,8 @@ fn write_tables(
         lfile.write_all(&offset.to_le_bytes())?;
         offset += 4 + list.len() as u64 * 4;
     }
-    let lookup_bytes = lfile.metadata()?.len();
+    lfile.flush()?;
+    let lookup_bytes = lfile.get_ref().metadata()?.len();
     drop(lfile);
 
     write_path_table(dir.join("files.dat"), FILES_HEADER, entries)?;
@@ -393,7 +516,7 @@ fn write_tables(
 }
 
 fn write_path_table(path: PathBuf, magic: &[u8], entries: &[FileEntry]) -> std::io::Result<()> {
-    let mut f = File::create(path)?;
+    let mut f = std::io::BufWriter::with_capacity(INDEX_WRITE_BUF_CAPACITY, File::create(path)?);
     f.write_all(magic)?;
     f.write_all(&(entries.len() as u64).to_le_bytes())?;
     for e in entries {
@@ -401,11 +524,12 @@ fn write_path_table(path: PathBuf, magic: &[u8], entries: &[FileEntry]) -> std::
         f.write_all(&(p.len() as u64).to_le_bytes())?;
         f.write_all(p.as_bytes())?;
     }
+    f.flush()?;
     Ok(())
 }
 
 fn write_meta_table(path: PathBuf, entries: &[FileEntry]) -> std::io::Result<()> {
-    let mut f = File::create(path)?;
+    let mut f = std::io::BufWriter::with_capacity(INDEX_WRITE_BUF_CAPACITY, File::create(path)?);
     f.write_all(META_HEADER)?;
     f.write_all(&(entries.len() as u64).to_le_bytes())?;
     for e in entries {
@@ -415,11 +539,12 @@ fn write_meta_table(path: PathBuf, entries: &[FileEntry]) -> std::io::Result<()>
         f.write_all(&e.mtime.to_le_bytes())?;
         f.write_all(&e.size.to_le_bytes())?;
     }
+    f.flush()?;
     Ok(())
 }
 
 fn write_grams_table(path: PathBuf, grams: &[GramRecord]) -> std::io::Result<()> {
-    let mut f = File::create(path)?;
+    let mut f = std::io::BufWriter::with_capacity(INDEX_WRITE_BUF_CAPACITY, File::create(path)?);
     f.write_all(GRAMS_HEADER)?;
     f.write_all(&(grams.len() as u64).to_le_bytes())?;
     for g in grams {
@@ -434,6 +559,7 @@ fn write_grams_table(path: PathBuf, grams: &[GramRecord]) -> std::io::Result<()>
             f.write_all(&h.to_le_bytes())?;
         }
     }
+    f.flush()?;
     Ok(())
 }
 
@@ -1084,5 +1210,53 @@ mod tests {
         let stats = update_index(&root, &idx_dir, &ScanOptions::default(), &mut progress).unwrap();
         assert_eq!(stats.reused_files, 0);
         assert!(Index::open(&idx_dir).is_ok());
+    }
+
+    #[test]
+    fn parallel_build_and_update_many_files() {
+        let root = tmpdir("parallel-many");
+        for i in 0..50 {
+            fs::write(
+                root.join(format!("file_{i:03}.txt")),
+                format!("content for file number {i} with unique_token_{i} and common_keyword\n"),
+            )
+            .unwrap();
+        }
+        let idx_dir = root.join(".rgx");
+        let mut progress = |_: &str| {};
+        let stats = build_index(&root, &idx_dir, &ScanOptions::default(), &mut progress).unwrap();
+        assert_eq!(stats.files, 50);
+
+        let index = Index::open(&idx_dir).unwrap();
+        assert_eq!(index.file_count(), 50);
+
+        let common_grams = crate::ngram::covering_ngrams(
+            b"common_keyword",
+            crate::ngram::DEFAULT_MAX_NGRAM_LENGTH,
+        );
+        for g in &common_grams {
+            let post = index.postings(ngram_hash(g));
+            assert_eq!(post.len(), 50, "all 50 files should contain common_keyword");
+        }
+
+        // Test incremental update
+        fs::write(
+            root.join("file_025.txt"),
+            "modified content with modified_token_25 and common_keyword\n",
+        )
+        .unwrap();
+        fs::write(
+            root.join("file_050.txt"),
+            "brand new file with brand_new_token and common_keyword\n",
+        )
+        .unwrap();
+
+        let update_stats =
+            update_index(&root, &idx_dir, &ScanOptions::default(), &mut progress).unwrap();
+        assert_eq!(update_stats.files, 51);
+        assert_eq!(update_stats.reused_files, 49);
+
+        let updated_index = Index::open(&idx_dir).unwrap();
+        assert_eq!(updated_index.file_count(), 51);
     }
 }
