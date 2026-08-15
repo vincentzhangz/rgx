@@ -14,8 +14,6 @@ jobs:
   create-release:
     name: create release
     runs-on: ubuntu-latest
-    outputs:
-      upload_url: ${{ steps.release.outputs.upload_url }}
     steps:
       - uses: actions/checkout@v4
 
@@ -63,4 +61,5 @@ jobs:
           target: ${{ matrix.target }}
           archive: rgx-$target
           checksum: sha256
-          upload_url: ${{ needs.create-release.outputs.upload_url }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+          ref: ${{ github.ref }}
