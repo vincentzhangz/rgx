@@ -30,10 +30,10 @@ install:
 	cargo install --path crates/rgx
 
 release-dry-run:
-	cargo release patch --workspace --dry-run
+	cargo release 0.1.0 --workspace --dry-run
 
 release:
-	cargo release patch --workspace
+	cargo release 0.1.0 --workspace
 
 clean:
 	cargo clean
