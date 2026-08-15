@@ -121,7 +121,7 @@ fn execute_cfg(cfg: Config, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     } else {
         cfg.root.clone()
     };
-    let root_abs = root.canonicalize().unwrap_or_else(|_| root.clone());
+    let root_abs = rgx_index::display_root(&root);
 
     let t_total = Instant::now();
     let mut t_build = None;

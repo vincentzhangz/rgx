@@ -1078,6 +1078,7 @@ mod tests {
         );
         let index = Index::open(&idx_dir).unwrap();
         assert_eq!(index.file_count(), 1);
+        drop(index);
 
         fs::remove_file(idx_dir.join("grams.dat")).unwrap();
         let stats = update_index(&root, &idx_dir, &ScanOptions::default(), &mut progress).unwrap();

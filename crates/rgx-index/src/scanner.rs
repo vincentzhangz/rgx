@@ -56,7 +56,7 @@ impl Default for ScanOptions {
 
 /// Walk `root` and return the list of indexable file paths, sorted.
 pub fn scan(root: &Path, opts: &ScanOptions) -> Vec<PathBuf> {
-    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    let root = display_root(root);
     let gitignore = Gitignore::load(root.as_path());
 
     let mut files = Vec::new();
@@ -64,6 +64,26 @@ pub fn scan(root: &Path, opts: &ScanOptions) -> Vec<PathBuf> {
     walk(&root, &root, opts, &gitignore, &mut visited, &mut files);
     files.sort();
     files
+}
+
+/// Canonicalize `root`, stripping the `\\?\` verbatim prefix that
+/// `std::fs::canonicalize` prepends to paths on Windows. The prefix is noise
+/// in user-facing output and confuses tooling that splits on `:` (drive
+/// letters) or parses paths, so returned paths use the conventional `C:\`
+/// (or `\\` UNC) form. A no-op on other platforms.
+pub fn display_root(root: &Path) -> PathBuf {
+    let canon = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    #[cfg(windows)]
+    {
+        let s = canon.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return match rest.strip_prefix("UNC\\") {
+                Some(unc) => PathBuf::from(format!(r"\\{unc}")),
+                None => PathBuf::from(rest),
+            };
+        }
+    }
+    canon
 }
 
 fn walk(
@@ -274,7 +294,7 @@ mod tests {
         fs::write(root.join("node_modules/dep.js"), "hello").unwrap();
 
         let files = scan(&root, &ScanOptions::default());
-        let canon_root = root.canonicalize().unwrap();
+        let canon_root = display_root(&root);
         assert_eq!(files, vec![canon_root.join("a.txt")]);
     }
 

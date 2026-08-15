@@ -215,7 +215,8 @@ fn search_from_subdirectory_uses_valid_paths() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(!stdout.is_empty());
     for line in stdout.lines() {
-        let path = line.split(':').next().unwrap();
+        let (rest, _text) = line.rsplit_once(':').unwrap();
+        let (path, _line) = rest.rsplit_once(':').unwrap();
         let p = Path::new(path);
         assert!(p.exists(), "result path must exist: {path}");
         assert!(
