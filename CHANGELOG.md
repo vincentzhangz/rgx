@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- Dropped open `Index` memory-mapped handles before incremental rebuilds in unit tests, fixing transient `ERROR_ACCESS_DENIED` failures on Windows.
+
+### Performance
+
+- **Memory-mapped index tables**: All index files (`lookup.dat`, `postings.dat`, `files.dat`, and `meta.dat`) are now 100% memory-mapped on open, eliminating heap allocations for path strings and table metadata.
+- **O(1) postings table header validation**: Index loading validates posting list bounds from header metadata in \(O(1)\), preventing untouched postings pages from being paged into physical RAM (RSS).
+- **Compact 4-byte record offsets**: Stored compact 4-byte `Vec<u32>` record offsets for files and metadata tables, slicing `&Path` zero-copy directly from the mmap.
+- **Packed 12-byte postings during build**: Introduced a packed 12-byte `Posting` struct (`#[repr(C, packed)]`) that reduces RAM usage by 25% during index builds and in-memory sorting.
+- **Streaming caches & in-place deduplication**: `grams.dat` streams via `BufReader` into `Arc<[u64]>`, and `file_grams` deduplicates n-grams in place with `sort_unstable` and `dedup`.
+- **Whole-content matcher fast-path**: Added an upfront `re.is_match(content)` check before line splitting, skipping line iterations entirely for false-positive candidates.
+- **Candidate set algebra & read buffer reuse**: Added `intersect_sorted_into` and `union_sorted_into` in `rgx-query` and reused per-thread file read buffers across candidates in `rgx`.
+- **Zero-allocation JSON streaming**: JSON Lines and submatch offsets are streamed directly to the writer without intermediate `String` or `Vec` formatting allocations.
+
 ## [0.1.0]
 
 ### Fixed
