@@ -1233,6 +1233,7 @@ mod tests {
             let post = index.postings(ngram_hash(g));
             assert_eq!(post.len(), 50, "all 50 files should contain common_keyword");
         }
+        drop(index);
 
         // Test incremental update
         fs::write(
