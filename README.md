@@ -29,8 +29,10 @@ candidates are read from disk, so search time scales with the number of
   `.git/info/exclude`, and custom `.rgxignore` files.
 - Hash-only keys are sound: a hash collision only widens the candidate set;
   verification is always exact.
-- The index is ASCII case-folded, so case-insensitive queries (`-i`) prune
-  correctly.
+- The index is ASCII case-folded, so mixed-case literals prune and `-i`
+  queries still verify correctly. Folding only widens the candidate set;
+  `regex` always matches the original file bytes. See [docs/BENCHMARKS.md](docs/BENCHMARKS.md)
+  for how to measure prune rate.
 - Corrupt or truncated indexes are detected at load time and reported as an
   error (exit 2) instead of crashing. First builds write the index in place;
   rebuilds write to a staging directory and atomically swap it in.
@@ -146,7 +148,7 @@ build_index(root, &index_dir, &ScanOptions::default(), &mut progress)?;
 let index = Index::open(&index_dir)?;
 let matches = search(&index, "fn [a-z_]+\\(", false)?;
 for m in &matches {
-    println!("{}:{}: {}", m.path, m.line, m.line_text.trim());
+    println!("{}:{}: {}", m.path, m.line, m.text.trim());
 }
 # Ok::<(), Box<dyn std::error::Error>>(())
 ```
@@ -165,6 +167,11 @@ $ ./scripts/coverage.sh           # HTML + LCOV report into target/coverage
 $ ./scripts/bench.sh              # rgx vs ripgrep on a synthetic corpus
 ```
 
+How to run that script, what to record, and how to report results in a
+pull request is documented in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+Dated machine runs (including the current ASCII-fold snapshot) live in
+[docs/historical-benchmarks/](docs/historical-benchmarks/README.md).
+
 Coverage is a developer aid and is never gated in CI.
 
 ## Workspace layout
@@ -180,11 +187,11 @@ Five files under `.rgx/`, all little-endian, versioned by magic bytes:
 
 | file         | contents                                                        |
 |--------------|-----------------------------------------------------------------|
-| `lookup.dat` | header + sorted `(hash u64, postings-offset u64)` entries        |
-| `postings.dat`| header + length-prefixed sorted `u32` file-id lists              |
-| `files.dat`  | header + length-prefixed file paths (index == file id)           |
-| `meta.dat`   | header + per-file `(path, mtime, size)` for change detection     |
-| `grams.dat`  | header + per-file `(path, mtime, size, content-hash, grams)` cache for incremental updates |
+| `lookup.dat` | `"RGXLOOK2"` + sorted `(hash u64, postings-offset u64)` entries  |
+| `postings.dat`| `"RGXPOST2"` + length-prefixed sorted `u32` file-id lists        |
+| `files.dat`  | `"RGXFILS2"` + length-prefixed file paths (index == file id)     |
+| `meta.dat`   | `"RGXMETA2"` + per-file `(path, mtime, size)` for change detection |
+| `grams.dat`  | `"RGXGRAM2"` + per-file `(path, mtime, size, content-hash, grams)` cache |
 
 ## License
 

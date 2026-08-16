@@ -15,7 +15,7 @@
 pub mod matcher;
 
 use matcher::{Match, match_content_str};
-use rgx_index::{Index, ScanOptions, build_index, update_index};
+use rgx_index::{Index, ScanOptions, build_index, index_format_stale, update_index};
 use rgx_query::{candidates, decompose};
 use std::io::Write;
 use std::path::PathBuf;
@@ -146,15 +146,19 @@ fn execute_cfg(cfg: Config, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         let index_missing = !idx_dir.join("lookup.dat").exists()
             || !idx_dir.join("postings.dat").exists()
             || !idx_dir.join("files.dat").exists();
+        let index_stale = index_format_stale(&idx_dir);
+        if index_stale {
+            let _ = writeln!(err, "rgx: rebuilding index (format RGXLOOK1 -> RGXLOOK2)");
+        }
 
-        if cfg.build || cfg.update || index_missing {
+        if cfg.build || cfg.update || index_missing || index_stale {
             let t0 = Instant::now();
             let mut progress = |msg: &str| {
                 if cfg.stats {
                     let _ = writeln!(err, "rgx: {msg}");
                 }
             };
-            let incremental = cfg.update && !cfg.build && !index_missing;
+            let incremental = cfg.update && !cfg.build && !index_missing && !index_stale;
             let result = if incremental {
                 update_index(&root_abs, &idx_dir, &scan_opts(&cfg), &mut progress)
             } else {
@@ -326,8 +330,11 @@ fn execute_cfg(cfg: Config, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 /// each candidate exactly with `regex`. An invalid pattern is returned as a
 /// [`regex::Error`]. When the pattern yields no useful literals, every
 /// indexed file is treated as a candidate.
+///
+/// Query plans are ASCII-folded to match the on-disk index. `ignore_case`
+/// only affects the `regex` verification step, not pruning.
 pub fn search(index: &Index, pattern: &str, ignore_case: bool) -> Result<Vec<Match>, regex::Error> {
-    let plan = decompose(pattern, !ignore_case);
+    let plan = decompose(pattern, true);
     let cand_ids =
         candidates(index, &plan).unwrap_or_else(|| (0..index.file_count() as u32).collect());
     let re = regex::bytes::RegexBuilder::new(pattern)
@@ -615,6 +622,33 @@ mod tests {
     fn search_invalid_pattern_errors() {
         let index = search_index("badpat", &[("a.txt", "x\n")]);
         assert!(search(&index, "[", false).is_err());
+    }
+
+    #[test]
+    fn search_mixed_case_literal_prunes_and_matches() {
+        let index = search_index(
+            "mixed",
+            &[
+                ("a.txt", "alpha beta gamma\n"),
+                ("b.txt", "needle_token_UNIQUE_1 sits here\n"),
+                ("c.txt", "omega\n"),
+            ],
+        );
+        let matches = search(&index, "needle_token_UNIQUE_1", false).unwrap();
+        assert_eq!(matches.len(), 1);
+        assert!(
+            matches[0].path.ends_with("b.txt"),
+            "path: {}",
+            matches[0].path
+        );
+
+        let plan = decompose("needle_token_UNIQUE_1", true);
+        let cands = candidates(&index, &plan).expect("mixed-case literal must prune");
+        assert_eq!(
+            cands.len(),
+            1,
+            "mixed-case literal must not scan the whole tree"
+        );
     }
 
     #[test]

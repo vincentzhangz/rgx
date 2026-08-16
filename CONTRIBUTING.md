@@ -47,6 +47,26 @@ $ cargo fmt --check
 - Keep commits focused; a small PR that lands is better than a large one that
   stalls.
 
+### Benchmarks
+
+PRs that change index or query behaviour, or that claim a speed or memory
+improvement, must include a **Benchmark** section that links to
+[docs/BENCHMARKS.md](docs/BENCHMARKS.md) and reports a run of that
+protocol (host, corpus, prune `candidates` for a mixed-case literal via
+`rgx --stats --time`, wall time vs `ripgrep` when available). Link a
+file under [docs/historical-benchmarks/](docs/historical-benchmarks/README.md)
+when you check in a dated snapshot; do not treat those numbers as the
+project's published performance.
+`scripts/bench.sh` covers timing vs ripgrep; mixed-case prune is a
+one-hit fixture until the generator emits `needle_token_UNIQUE_*`.
+
+Do not paste a wall-clock table with no method. Numbers from one machine
+go stale; the protocol is what the next reviewer re-runs.
+
+Docs-only or typo PRs do not need a bench. Improvements to the protocol
+itself (CPU, RSS, prune rate, corpus recipe) are welcome — land them in
+`docs/BENCHMARKS.md` and `scripts/bench.sh` in the same PR that uses them.
+
 ## Releasing
 
 Releases are cut with [cargo-release](https://github.com/cargo-bins/cargo-release),

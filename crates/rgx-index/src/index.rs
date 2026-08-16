@@ -2,18 +2,18 @@
 //!
 //! Layout inside `<root>/.rgx/` (all little-endian):
 //!
-//! * `lookup.dat`  — `"RGXLOOK1"` + `u64 count` + sorted entries of
+//! * `lookup.dat`  — `"RGXLOOK2"` + `u64 count` + sorted entries of
 //!   `(u64 ngram_hash, u64 postings_offset)`, 16 bytes each. Mmap'd and
 //!   binary-searched. Offset is absolute into `postings.dat`.
-//! * `postings.dat`— `"RGXPOST1"` + `u64 count` + `u64 total_ids` + posting
+//! * `postings.dat`— `"RGXPOST2"` + `u64 count` + `u64 total_ids` + posting
 //!   lists. Each list is `u32 id_count` followed by `id_count` sorted `u32`
 //!   file ids. Mmap'd; lists are located by lookup offsets.
-//! * `files.dat`   — `"RGXFILS1"` + `u64 count` + `u64 len` + path bytes,
+//! * `files.dat`   — `"RGXFILS2"` + `u64 count` + `u64 len` + path bytes,
 //!   repeated. File id = sequence index (0-based).
-//! * `meta.dat`    — `"RGXMETA1"` + `u64 count` + `u64 plen` + path +
+//! * `meta.dat`    — `"RGXMETA2"` + `u64 count` + `u64 plen` + path +
 //!   `u64 mtime` + `u64 size`, repeated. Same order as `files.dat`; used for
 //!   change detection.
-//! * `grams.dat`   — `"RGXGRAM1"` + `u64 count` + per-file records of
+//! * `grams.dat`   — `"RGXGRAM2"` + `u64 count` + per-file records of
 //!   `(plen, path, mtime, size, content_hash u128, gram_count, grams...)`.
 //!   A per-file n-gram cache keyed by `(mtime, size, content_hash)`; this is
 //!   what makes `--update` incremental (unchanged files are never re-read).
@@ -34,17 +34,22 @@ use crate::scanner::{ScanOptions, scan};
 use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::time::UNIX_EPOCH;
 
-const POSTINGS_HEADER: &[u8] = b"RGXPOST1";
-const LOOKUP_HEADER: &[u8] = b"RGXLOOK1";
-const FILES_HEADER: &[u8] = b"RGXFILS1";
-const META_HEADER: &[u8] = b"RGXMETA1";
-const GRAMS_HEADER: &[u8] = b"RGXGRAM1";
+const POSTINGS_HEADER: &[u8] = b"RGXPOST2";
+const LOOKUP_HEADER: &[u8] = b"RGXLOOK2";
+const FILES_HEADER: &[u8] = b"RGXFILS2";
+const META_HEADER: &[u8] = b"RGXMETA2";
+const GRAMS_HEADER: &[u8] = b"RGXGRAM2";
+
+/// Previous lookup magic. The CLI rebuilds when it sees this; `Index::open`
+/// still rejects it as bad magic so the library never rewrites the caller's
+/// index directory as a side effect.
+const STALE_LOOKUP_HEADER: &[u8] = b"RGXLOOK1";
 
 /// Header layout: 8 magic bytes + 8 count bytes = 16.
 const HEADER_LEN: usize = 16;
@@ -413,9 +418,14 @@ impl GramsWriter {
 }
 
 /// Collect the distinct n-grams of a file's content (length >= 3).
+///
+/// Bytes are ASCII-folded before n-gram extraction so the on-disk index
+/// matches query plans produced with `fold_case = true`. Folding only
+/// widens the candidate set; `regex` still verifies the original bytes.
 fn file_grams(content: &[u8]) -> Vec<u64> {
+    let folded: Vec<u8> = content.iter().map(|b| b.to_ascii_lowercase()).collect();
     let mut ids = Vec::new();
-    build_all_ngrams(content, &mut |gram| {
+    build_all_ngrams(&folded, &mut |gram| {
         if gram.len() >= MIN_NGRAM_LENGTH {
             ids.push(ngram_hash(gram));
         }
@@ -423,6 +433,26 @@ fn file_grams(content: &[u8]) -> Vec<u64> {
     ids.sort_unstable();
     ids.dedup();
     ids
+}
+
+/// True when `index_dir/lookup.dat` has the current magic (`RGXLOOK2`).
+pub fn index_format_current(index_dir: &Path) -> bool {
+    lookup_magic(index_dir).as_ref().map(|m| m.as_slice()) == Some(LOOKUP_HEADER)
+}
+
+/// True when `index_dir/lookup.dat` is a known previous format (`RGXLOOK1`).
+///
+/// Garbage or truncated files are **not** stale: the caller must fail closed
+/// rather than rebuild over a corrupt index.
+pub fn index_format_stale(index_dir: &Path) -> bool {
+    lookup_magic(index_dir).as_ref().map(|m| m.as_slice()) == Some(STALE_LOOKUP_HEADER)
+}
+
+fn lookup_magic(index_dir: &Path) -> Option<[u8; 8]> {
+    let mut file = File::open(index_dir.join("lookup.dat")).ok()?;
+    let mut magic = [0u8; 8];
+    file.read_exact(&mut magic).ok()?;
+    Some(magic)
 }
 
 /// Number of distinct gram hashes in a sorted flat postings vector.
@@ -1000,6 +1030,56 @@ mod tests {
         for h in absent_hashes {
             assert!(!index.has_ngram(h));
         }
+    }
+
+    #[test]
+    fn mixed_case_content_indexes_folded_grams() {
+        let root = tmpdir("fold-grams");
+        fs::write(root.join("hit.txt"), "needle_token_UNIQUE_1 sits here\n").unwrap();
+        fs::write(root.join("miss.txt"), "nothing interesting\n").unwrap();
+        let idx_dir = root.join(".rgx");
+        let mut progress = |_: &str| {};
+        build_index(&root, &idx_dir, &ScanOptions::default(), &mut progress).unwrap();
+        let index = Index::open(&idx_dir).unwrap();
+        assert!(index_format_current(&idx_dir));
+        assert!(!index_format_stale(&idx_dir));
+
+        let folded = b"needle_token_unique_1";
+        for gram in crate::ngram::covering_ngrams(folded, crate::ngram::DEFAULT_MAX_NGRAM_LENGTH) {
+            let post = index.postings(ngram_hash(&gram));
+            assert!(
+                !post.is_empty(),
+                "folded gram {:?} must be indexed",
+                String::from_utf8_lossy(&gram)
+            );
+            assert!(
+                post.iter()
+                    .any(|&id| index.file_path(id).unwrap().ends_with("hit.txt"))
+            );
+            assert!(
+                !post
+                    .iter()
+                    .any(|&id| index.file_path(id).unwrap().ends_with("miss.txt")),
+                "unique folded grams must not post miss.txt"
+            );
+        }
+    }
+
+    #[test]
+    fn index_format_stale_detects_look1_only() {
+        let root = tmpdir("stale-magic");
+        fs::create_dir_all(root.join(".rgx")).unwrap();
+        fs::write(
+            root.join(".rgx/lookup.dat"),
+            b"RGXLOOK1\x00\x00\x00\x00\x00\x00\x00\x00",
+        )
+        .unwrap();
+        assert!(index_format_stale(&root.join(".rgx")));
+        assert!(!index_format_current(&root.join(".rgx")));
+
+        fs::write(root.join(".rgx/lookup.dat"), b"garbage-not-a-lookup").unwrap();
+        assert!(!index_format_stale(&root.join(".rgx")));
+        assert!(!index_format_current(&root.join(".rgx")));
     }
 
     #[test]

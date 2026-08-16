@@ -31,6 +31,8 @@ pub mod index;
 pub mod ngram;
 pub mod scanner;
 
-pub use index::{BuildStats, Index, build_index, update_index};
+pub use index::{
+    BuildStats, Index, build_index, index_format_current, index_format_stale, update_index,
+};
 pub use ngram::{DEFAULT_MAX_NGRAM_LENGTH, MIN_NGRAM_LENGTH};
 pub use scanner::{DEFAULT_MAX_FILE_SIZE, ScanOptions, display_root};

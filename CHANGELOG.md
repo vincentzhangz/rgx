@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+
+- The on-disk index is ASCII-folded (`file_grams`), matching query plans
+  that already folded extracted literals. Mixed-case identifiers prune
+  instead of falling back to a full tree walk. `rgx::search` always folds
+  the plan; `-i` remains a `regex` flag only.
+- Stale `RGXLOOK1` indexes are rebuilt by the CLI (stderr notice) rather
+  than loaded. `Index::open` still rejects unknown magic so the library
+  never rewrites the caller's `.rgx/` as a side effect. All five table
+  magics are now `*2` so `--update` cannot reuse unfolded `grams.dat`.
+
+### Documentation
+
+- [docs/BENCHMARKS.md](docs/BENCHMARKS.md) is the durable measurement
+  protocol. Dated machine runs live in
+  [docs/historical-benchmarks/](docs/historical-benchmarks/README.md)
+  (current: ASCII-fold UNIQUE prune is 1 candidate, 12.4 ms vs ripgrep
+  298 ms on this host). CONTRIBUTING requires index/query PRs to link
+  the protocol and report a run, not timings with no host, corpus, or
+  flags.
+
 ## [0.1.1]
 
 ### Fixed
