@@ -164,9 +164,30 @@ fn stale_look1_index_rebuilds() {
     assert_eq!(code, 0);
     assert!(!stdout.is_empty());
     assert!(
-        stderr.contains("rebuilding index (format RGXLOOK1 → RGXLOOK2)"),
+        stderr.contains("rebuilding index (format RGXLOOK1 -> RGXLOOK2)"),
         "stderr: {stderr}"
     );
+}
+
+#[test]
+fn stale_look1_with_update_full_rebuilds() {
+    let root = fixture("stale-look1-update");
+    standard_fixture(&root);
+    let (code, _, _) = run(&["hello", root.to_str().unwrap()]);
+    assert_eq!(code, 0);
+    let lookup = root.join(".rgx/lookup.dat");
+    let mut bytes = fs::read(&lookup).unwrap();
+    bytes[..8].copy_from_slice(b"RGXLOOK1");
+    fs::write(&lookup, bytes).unwrap();
+    let (code, stdout, stderr) = run(&["--update", "hello", root.to_str().unwrap()]);
+    assert_eq!(code, 0);
+    assert!(!stdout.is_empty());
+    assert!(
+        stderr.contains("rebuilding index (format RGXLOOK1 -> RGXLOOK2)"),
+        "LOOK1 plus --update must full-rebuild, not incremental: {stderr}"
+    );
+    let magic = fs::read(root.join(".rgx/lookup.dat")).unwrap();
+    assert_eq!(&magic[..8], b"RGXLOOK2");
 }
 
 #[test]

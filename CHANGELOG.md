@@ -21,8 +21,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Documentation
 
 - [docs/BENCHMARKS.md](docs/BENCHMARKS.md) is the durable measurement
-  protocol. CONTRIBUTING requires index/query PRs to link it instead of
-  dumping rotting wall-clock tables.
+  protocol. CONTRIBUTING requires index/query PRs to link it and report
+  a run of that method, not timings with no host, corpus, or flags.
 
 ## [0.1.1]
 

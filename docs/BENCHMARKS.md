@@ -31,7 +31,9 @@ $ ./scripts/bench.sh
 `scripts/bench.sh` builds a synthetic corpus (default 10,000 files),
 warms the index, and compares `rgx` to `ripgrep` (and `grep` when
 present). Override `N_FILES`, `ITERS`, `WARMUP`, `CORPUS`, `BIN`, and
-`RG` as documented in the script header.
+`RG` as documented in the script header. The script's corpus does **not**
+yet emit a mixed-case unique token; prune rate for that class is a
+separate `--stats --time` run (see *Prune rate* below).
 
 On Windows, run it from Git Bash or WSL. Peak working set and private
 bytes are not what `/usr/bin/time -p` reports; see *Memory* below.
@@ -45,7 +47,16 @@ search stdout so printing does not dominate. Take the median of at least
 ### 1. Prune rate (correctness first)
 
 For every pattern you claim is "indexed", print `--stats --time` and
-record `candidates` vs `index: N files`.
+record `candidates` vs `index: N files`. Mixed-case prune is this
+fixture measurement, not `scripts/bench.sh`, until the generator emits
+`needle_token_UNIQUE_*`.
+
+```console
+$ rgx --stats --time 'needle_token_UNIQUE_1' /path/to/fixture
+```
+
+The fixture must contain that mixed-case token in **one** file. Expect
+`1 candidates`.
 
 | Pattern class | Example | Expectation |
 |---------------|---------|-------------|

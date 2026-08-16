@@ -107,7 +107,7 @@ for m in &matches {
   full CLI as a callable function (matching results → `out`, diagnostics →
   `err`). `rgx::run()` is the thin binary wrapper; `rgx::Config` is the parsed
   CLI config; `rgx::json_escape` escapes for JSON output.
-- `Match` has `path`, 1-based `line`, `line_text`, and `submatches` byte
+- `Match` has `path`, 1-based `line`, `text`, and `submatches` byte
   offsets when JSON-typed.
 - `rgx-index` and `rgx-query` are re-exported transitively via the `rgx` crate.
 

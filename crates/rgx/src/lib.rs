@@ -148,7 +148,7 @@ fn execute_cfg(cfg: Config, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
             || !idx_dir.join("files.dat").exists();
         let index_stale = index_format_stale(&idx_dir);
         if index_stale {
-            let _ = writeln!(err, "rgx: rebuilding index (format RGXLOOK1 → RGXLOOK2)");
+            let _ = writeln!(err, "rgx: rebuilding index (format RGXLOOK1 -> RGXLOOK2)");
         }
 
         if cfg.build || cfg.update || index_missing || index_stale {

@@ -52,8 +52,10 @@ $ cargo fmt --check
 PRs that change index or query behaviour, or that claim a speed or memory
 improvement, must include a **Benchmark** section that links to
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md) and reports a run of that
-protocol (host, corpus, prune `candidates` for a mixed-case literal, wall
-time vs `ripgrep` when available).
+protocol (host, corpus, prune `candidates` for a mixed-case literal via
+`rgx --stats --time`, wall time vs `ripgrep` when available).
+`scripts/bench.sh` covers timing vs ripgrep; mixed-case prune is a
+one-hit fixture until the generator emits `needle_token_UNIQUE_*`.
 
 Do not paste a wall-clock table with no method. Numbers from one machine
 go stale; the protocol is what the next reviewer re-runs.

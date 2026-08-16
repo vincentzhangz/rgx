@@ -34,7 +34,7 @@ use crate::scanner::{ScanOptions, scan};
 use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::{self, File};
-use std::io::{BufWriter, Seek, SeekFrom, Write};
+use std::io::{BufWriter, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
@@ -449,8 +449,10 @@ pub fn index_format_stale(index_dir: &Path) -> bool {
 }
 
 fn lookup_magic(index_dir: &Path) -> Option<[u8; 8]> {
-    let data = fs::read(index_dir.join("lookup.dat")).ok()?;
-    data.get(..8)?.try_into().ok()
+    let mut file = File::open(index_dir.join("lookup.dat")).ok()?;
+    let mut magic = [0u8; 8];
+    file.read_exact(&mut magic).ok()?;
+    Some(magic)
 }
 
 /// Number of distinct gram hashes in a sorted flat postings vector.
@@ -1053,6 +1055,12 @@ mod tests {
             assert!(
                 post.iter()
                     .any(|&id| index.file_path(id).unwrap().ends_with("hit.txt"))
+            );
+            assert!(
+                !post
+                    .iter()
+                    .any(|&id| index.file_path(id).unwrap().ends_with("miss.txt")),
+                "unique folded grams must not post miss.txt"
             );
         }
     }
