@@ -13,4 +13,4 @@ include = ["src/**"]
 
 [dependencies]
 regex-syntax = { workspace = true }
-rgx-index = { version = "0.1.0", path = "../rgx-index" }
+rgx-index = { version = "0.1.1", path = "../rgx-index" }

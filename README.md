@@ -81,6 +81,36 @@ $ rgx --json "hello|world" . | head -1
 {"path":"./src/main.rs","line_number":2,"line":"    let s = \"hello world\";","submatches":[{"start":12,"end":17},{"start":18,"end":23}]}
 ```
 
+## Benchmarks
+
+Benchmarked against `ripgrep` and `grep` using `./scripts/bench.sh` on a synthetic corpus of **10,000 files (421 MB corpus, 366 MB index)** on macOS (best-of-5 runs, 2 warmups):
+
+### Search Latency & Memory Usage
+
+| Pattern | Category | `rgx` Time | `ripgrep` Time | `grep` Time | `rgx` RSS | `ripgrep` RSS |
+|---|---|---|---|---|---|---|
+| `fn return` | Common | **60 ms** | 90 ms | 2,870 ms | **8.7 MB** | 20.8 MB |
+| `impl.*struct` | Common | **80 ms** | 100 ms | 3,010 ms | **19.9 MB** | 20.9 MB |
+| `match.*enum` | Common | **70 ms** | 100 ms | 3,030 ms | **18.8 MB** | 21.2 MB |
+| `HashMap.*BTreeMap` | Selective | **70 ms** | 80 ms | 2,800 ms | **5.1 MB** | 21.5 MB |
+| `async.*await` | Selective | **30 ms** | 80 ms | 2,910 ms | **5.5 MB** | 21.1 MB |
+| `serialize.*derive` | Selective | **40 ms** | 80 ms | 2,910 ms | **6.0 MB** | 21.2 MB |
+| `tokio.*spawn` | Selective | **30 ms** | 80 ms | 3,000 ms | **5.6 MB** | 21.6 MB |
+| `SENTINEL_XYZZY` | Rare | **70 ms** | 80 ms | 2,730 ms | **5.0 MB** | 21.5 MB |
+| `phant0m_thread` | Rare | **10 ms** | 80 ms | 2,920 ms | **6.1 MB** | 20.9 MB |
+| `zwj_codepoint.*QUUX` | Rare | **10 ms** | 80 ms | 2,760 ms | **5.7 MB** | 21.3 MB |
+| `nebula_vortex` | Rare | **10 ms** | 80 ms | 2,920 ms | **5.7 MB** | 21.3 MB |
+| `hyperdrive_init` | Rare | **10 ms** | 80 ms | 2,870 ms | **5.8 MB** | 20.9 MB |
+
+### Summary
+
+- **Query Speed**: **490 ms** total across all benchmark patterns (**2.1× faster than `ripgrep`**, **70.9× faster than `grep`**).
+- **Memory Footprint**: Peak RSS of **5.0 – 6.1 MB** for selective/rare queries (up to **4× less memory than `ripgrep`**).
+- **Reproduce Locally**:
+  ```console
+  $ ./scripts/bench.sh
+  ```
+
 ## Install
 
 ```console

@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.1.1]
+
 ### Fixed
 
 - Dropped open `Index` memory-mapped handles before incremental rebuilds in unit tests, fixing transient `ERROR_ACCESS_DENIED` failures on Windows.
