@@ -62,7 +62,7 @@ pub fn ngram_hash(bytes: &[u8]) -> u64 {
 /// potentially with duplicates.
 pub fn build_all_ngrams(s: &[u8], consumer: &mut impl FnMut(&[u8])) {
     let n = s.len();
-    let mut st: Vec<(u32, usize)> = Vec::with_capacity(n / 2 + 1);
+    let mut st: Vec<(u32, usize)> = Vec::with_capacity((n / 2 + 1).min(64));
     let mut i = 0usize;
     while i + 2 <= n {
         let hash = hash_bigram(&s[i..]);
@@ -92,7 +92,7 @@ pub fn build_all_ngrams(s: &[u8], consumer: &mut impl FnMut(&[u8])) {
 pub fn build_covering_ngrams(s: &[u8], consumer: &mut impl FnMut(&[u8]), max_ngram_length: usize) {
     let n = s.len();
     let mut st: std::collections::VecDeque<(u32, usize)> =
-        std::collections::VecDeque::with_capacity(n / 2 + 1);
+        std::collections::VecDeque::with_capacity((n / 2 + 1).min(32));
     let mut i = 0usize;
     while i + 2 <= n {
         let hash = hash_bigram(&s[i..]);

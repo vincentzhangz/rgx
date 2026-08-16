@@ -14,7 +14,7 @@
 
 pub mod matcher;
 
-use matcher::{Match, match_content};
+use matcher::{Match, match_content_str};
 use rgx_index::{Index, ScanOptions, build_index, update_index};
 use rgx_query::{candidates, decompose};
 use std::io::Write;
@@ -187,8 +187,7 @@ fn execute_cfg(cfg: Config, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         match Index::open(&idx_dir) {
             Ok(idx) => {
                 t_load = Some(t0.elapsed());
-                let all: Vec<u32> = (0..idx.file_count() as u32).collect();
-                (Some(idx), all)
+                (Some(idx), Vec::new())
             }
             Err(e) => {
                 let _ = writeln!(err, "rgx: cannot load index at {}: {e}", idx_dir.display());
@@ -234,17 +233,17 @@ fn execute_cfg(cfg: Config, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let matches = if let Some(idx) = &index {
         parallel_match(idx, &cand_ids, &re, cfg.json)
     } else {
+        use std::io::Read;
         let files = rgx_index::scanner::scan(&root_abs, &scan_opts(&cfg));
         let mut out = Vec::new();
+        let mut file_buf = Vec::new();
         for p in &files {
-            if let Ok(content) = std::fs::read(p) {
-                match_content(
-                    &re,
-                    &content,
-                    p.to_string_lossy().into_owned(),
-                    cfg.json,
-                    &mut out,
-                );
+            let Ok(mut f) = std::fs::File::open(p) else {
+                continue;
+            };
+            file_buf.clear();
+            if f.read_to_end(&mut file_buf).is_ok() {
+                match_content_str(&re, &file_buf, &p.to_string_lossy(), cfg.json, &mut out);
             }
         }
         out
@@ -256,18 +255,18 @@ fn execute_cfg(cfg: Config, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let mut out = std::io::BufWriter::new(out);
     for m in &matches {
         if cfg.json {
-            let _ = writeln!(
-                out,
-                "{{\"path\":{},\"line_number\":{},\"line\":{},\"submatches\":[{}]}}",
-                json_escape(&m.path),
-                m.line,
-                json_escape(&m.text),
-                m.submatches
-                    .iter()
-                    .map(|(s, e)| format!("{{\"start\":{s},\"end\":{e}}}"))
-                    .collect::<Vec<_>>()
-                    .join(",")
-            );
+            let _ = out.write_all(b"{\"path\":");
+            let _ = write_json_escaped(&mut out, &m.path);
+            let _ = write!(out, ",\"line_number\":{},\"line\":", m.line);
+            let _ = write_json_escaped(&mut out, &m.text);
+            let _ = out.write_all(b",\"submatches\":[");
+            for (idx, (s, e)) in m.submatches.iter().enumerate() {
+                if idx > 0 {
+                    let _ = out.write_all(b",");
+                }
+                let _ = write!(out, "{{\"start\":{s},\"end\":{e}}}");
+            }
+            let _ = out.write_all(b"]}\n");
         } else {
             let _ = writeln!(out, "{}:{}:{}", m.path, m.line, m.text);
         }
@@ -346,6 +345,7 @@ fn parallel_match(
     re: &regex::bytes::Regex,
     json: bool,
 ) -> Vec<Match> {
+    use std::io::Read;
     let threads = std::thread::available_parallelism()
         .map(|n| n.get())
         .unwrap_or(4)
@@ -358,23 +358,21 @@ fn parallel_match(
         let handles: Vec<_> = cand_ids
             .chunks(chunk)
             .map(|slice| {
-                let ids = slice.to_vec();
                 s.spawn(move || {
                     let mut out = Vec::new();
-                    for id in ids {
+                    let mut file_buf = Vec::new();
+                    for &id in slice {
                         let Some(path) = index.file_path(id) else {
                             continue;
                         };
-                        let Ok(content) = std::fs::read(path) else {
+                        let Ok(mut file) = std::fs::File::open(path) else {
                             continue;
                         };
-                        match_content(
-                            re,
-                            &content,
-                            path.to_string_lossy().into_owned(),
-                            json,
-                            &mut out,
-                        );
+                        file_buf.clear();
+                        if file.read_to_end(&mut file_buf).is_err() {
+                            continue;
+                        }
+                        match_content_str(re, &file_buf, &path.to_string_lossy(), json, &mut out);
                     }
                     out
                 })
@@ -385,6 +383,34 @@ fn parallel_match(
             .flat_map(|h| h.join().unwrap_or_default())
             .collect()
     })
+}
+
+fn write_json_escaped(w: &mut dyn Write, s: &str) -> std::io::Result<()> {
+    w.write_all(b"\"")?;
+    let bytes = s.as_bytes();
+    let mut start = 0;
+    for (i, c) in s.char_indices() {
+        let esc = match c {
+            '"' => "\\\"",
+            '\\' => "\\\\",
+            '\n' => "\\n",
+            '\r' => "\\r",
+            '\t' => "\\t",
+            _ if (c as u32) < 0x20 => {
+                w.write_all(&bytes[start..i])?;
+                write!(w, "\\u{:04x}", c as u32)?;
+                start = i + c.len_utf8();
+                continue;
+            }
+            _ => continue,
+        };
+        w.write_all(&bytes[start..i])?;
+        w.write_all(esc.as_bytes())?;
+        start = i + c.len_utf8();
+    }
+    w.write_all(&bytes[start..])?;
+    w.write_all(b"\"")?;
+    Ok(())
 }
 
 /// Escape a string for a JSON string literal.

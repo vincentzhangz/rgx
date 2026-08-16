@@ -30,37 +30,57 @@ pub fn candidates(index: &Index, plan: &QueryPlan) -> Option<Vec<u32>> {
 }
 
 /// Union over branches of (intersection over each branch's n-grams).
+/// Posting lists are fetched into reused buffers to avoid fresh
+/// allocations per gram.
 fn side_candidates(index: &Index, branches: &[Branch]) -> Option<Vec<u32>> {
     if branches.is_empty() {
         return None;
     }
+    let mut post = Vec::new();
+    let mut acc = Vec::new();
+    let mut tmp_acc = Vec::new();
     let mut result: Option<Vec<u32>> = None;
+    let mut tmp_result = Vec::new();
+
     for b in branches {
-        let mut acc: Option<Vec<u32>> = None;
+        let mut first = true;
+        let mut empty = false;
         for g in &b.grams {
-            let post = index.postings(ngram_hash(g));
+            index.postings_into(ngram_hash(g), &mut post);
             if post.is_empty() {
-                acc = None;
+                empty = true;
                 break;
             }
-            acc = Some(match acc {
-                None => post,
-                Some(cur) => intersect_sorted(&cur, &post),
-            });
+            if first {
+                acc.clear();
+                acc.extend_from_slice(&post);
+                first = false;
+            } else {
+                intersect_sorted_into(&acc, &post, &mut tmp_acc);
+                std::mem::swap(&mut acc, &mut tmp_acc);
+                if acc.is_empty() {
+                    empty = true;
+                    break;
+                }
+            }
         }
-        if let Some(acc) = acc {
-            result = Some(match result {
-                None => acc,
-                Some(cur) => union_sorted(&cur, &acc),
-            });
+        if !empty && !first {
+            match result.as_mut() {
+                None => result = Some(std::mem::take(&mut acc)),
+                Some(res) => {
+                    union_sorted_into(res, &acc, &mut tmp_result);
+                    std::mem::swap(res, &mut tmp_result);
+                }
+            }
         }
     }
     result
 }
 
-/// Merge-intersect two sorted `u32` vectors.
-pub fn intersect_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
-    let mut out = Vec::with_capacity(a.len().min(b.len()));
+/// Merge-intersect two sorted `u32` slices, appending to `out` (cleared first).
+pub fn intersect_sorted_into(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
+    out.clear();
+    out.reserve(a.len().min(b.len()));
     let (mut i, mut j) = (0usize, 0usize);
     while i < a.len() && j < b.len() {
         match a[i].cmp(&b[j]) {
@@ -73,12 +93,12 @@ pub fn intersect_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
             }
         }
     }
-    out
 }
 
-/// Merge-union two sorted `u32` vectors.
-pub fn union_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
-    let mut out = Vec::with_capacity(a.len() + b.len());
+/// Merge-union two sorted `u32` slices, appending to `out` (cleared first).
+pub fn union_sorted_into(a: &[u32], b: &[u32], out: &mut Vec<u32>) {
+    out.clear();
+    out.reserve(a.len() + b.len());
     let (mut i, mut j) = (0usize, 0usize);
     while i < a.len() && j < b.len() {
         match a[i].cmp(&b[j]) {
@@ -99,6 +119,19 @@ pub fn union_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
     }
     out.extend_from_slice(&a[i..]);
     out.extend_from_slice(&b[j..]);
+}
+
+/// Merge-intersect two sorted `u32` vectors.
+pub fn intersect_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut out = Vec::new();
+    intersect_sorted_into(a, b, &mut out);
+    out
+}
+
+/// Merge-union two sorted `u32` vectors.
+pub fn union_sorted(a: &[u32], b: &[u32]) -> Vec<u32> {
+    let mut out = Vec::new();
+    union_sorted_into(a, b, &mut out);
     out
 }
 

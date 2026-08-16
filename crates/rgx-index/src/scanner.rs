@@ -135,7 +135,9 @@ fn indexable_file(path: &Path, opts: &ScanOptions) -> bool {
         return false;
     }
     if let Some(ext) = path.extension().and_then(|e| e.to_str())
-        && BINARY_EXTENSIONS.contains(&ext.to_ascii_lowercase().as_str())
+        && BINARY_EXTENSIONS
+            .iter()
+            .any(|&b| ext.eq_ignore_ascii_case(b))
     {
         return false;
     }
