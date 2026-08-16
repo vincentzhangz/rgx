@@ -170,8 +170,10 @@ fn literal_bytes(lit: &regex_syntax::hir::literal::Literal) -> Vec<u8> {
 
 /// Decompose a regex pattern into a query plan.
 ///
-/// `fold_case` lowercases extracted literals so they match a case-folded
-/// index (used for both `-i` queries and folded indexes).
+/// `fold_case` ASCII-lowercases extracted literals. The on-disk index is
+/// always built from ASCII-folded bytes, so callers that query that index
+/// must pass `true` (the CLI and `rgx::search` do). Passing `false` is
+/// only useful for inspecting the unfolded covering set in tests.
 pub fn decompose(pattern: &str, fold_case: bool) -> QueryPlan {
     let hir = match regex_syntax::Parser::new().parse(pattern) {
         Ok(h) => h,

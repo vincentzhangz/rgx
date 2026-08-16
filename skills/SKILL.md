@@ -20,7 +20,9 @@ Cursor's ["fast regex search"][paper] paper (rewritten against
   suffix gram postings, then verified exactly with `regex`.
 - Search time scales with the number of matching files, not the tree size.
 - Hash collisions only widen the candidate set; verification is always exact.
-- The index is ASCII case-folded, so `-i` prunes correctly.
+- The index is ASCII case-folded, so mixed-case literals prune and `-i`
+  still verifies correctly. Folding only widens candidates; `regex` matches
+  original bytes.
 - `--update` is incremental: unchanged files are never re-read (per-file cache
   keyed by mtime/size/content-hash in `grams.dat`). First build writes in
   place; rebuilds stage then atomically swap.
@@ -95,7 +97,7 @@ build_index(root, &index_dir, &ScanOptions::default(), &mut progress)?;
 let index = Index::open(&index_dir)?;
 let matches = search(&index, "fn [a-z_]+\\(", false)?;
 for m in &matches {
-    println!("{}:{}: {}", m.path, m.line, m.line_text.trim());
+    println!("{}:{}: {}", m.path, m.line, m.text.trim());
 }
 ```
 
@@ -122,8 +124,8 @@ for m in &matches {
 
 ### `rgx-query`
 
-- `decompose(pattern: &str, case_sensitive: bool) -> QueryPlan` — covering
-  n-gram plan.
+- `decompose(pattern: &str, fold_case: bool) -> QueryPlan` — covering
+  n-gram plan. Pass `true` when querying the on-disk index.
 - `candidates(index: &Index, &plan) -> Option<Vec<u32>>` — pruned file ids;
   `None` when the pattern has no useful literals (caller then scans all files).
 - `QueryPlan`, `Branch`, `intersect_sorted`, `union_sorted`.

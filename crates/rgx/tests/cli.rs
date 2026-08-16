@@ -131,6 +131,45 @@ fn ignore_case() {
 }
 
 #[test]
+fn mixed_case_literal_prunes() {
+    let root = fixture("mixed-prune");
+    write(&root.join("a.txt"), "alpha beta gamma\n");
+    write(&root.join("b.txt"), "needle_token_UNIQUE_1 sits here\n");
+    write(&root.join("c.txt"), "omega\n");
+    let (code, stdout, stderr) = run(&[
+        "--stats",
+        "--time",
+        "needle_token_UNIQUE_1",
+        root.to_str().unwrap(),
+    ]);
+    assert_eq!(code, 0);
+    assert!(stdout.contains("needle_token_UNIQUE_1"));
+    assert!(
+        stderr.contains("1 candidates"),
+        "mixed-case literal must prune: {stderr}"
+    );
+}
+
+#[test]
+fn stale_look1_index_rebuilds() {
+    let root = fixture("stale-look1");
+    standard_fixture(&root);
+    let (code, _, _) = run(&["hello", root.to_str().unwrap()]);
+    assert_eq!(code, 0);
+    let lookup = root.join(".rgx/lookup.dat");
+    let mut bytes = fs::read(&lookup).unwrap();
+    bytes[..8].copy_from_slice(b"RGXLOOK1");
+    fs::write(&lookup, bytes).unwrap();
+    let (code, stdout, stderr) = run(&["hello", root.to_str().unwrap()]);
+    assert_eq!(code, 0);
+    assert!(!stdout.is_empty());
+    assert!(
+        stderr.contains("rebuilding index (format RGXLOOK1 → RGXLOOK2)"),
+        "stderr: {stderr}"
+    );
+}
+
+#[test]
 fn json_output_shape() {
     let root = fixture("json");
     standard_fixture(&root);
