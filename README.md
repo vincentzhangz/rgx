@@ -169,6 +169,8 @@ $ ./scripts/bench.sh              # rgx vs ripgrep on a synthetic corpus
 
 How to run that script, what to record, and how to report results in a
 pull request is documented in [docs/BENCHMARKS.md](docs/BENCHMARKS.md).
+Dated machine runs (including the current ASCII-fold snapshot) live in
+[docs/historical-benchmarks/](docs/historical-benchmarks/README.md).
 
 Coverage is a developer aid and is never gated in CI.
 

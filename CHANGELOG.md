@@ -21,8 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Documentation
 
 - [docs/BENCHMARKS.md](docs/BENCHMARKS.md) is the durable measurement
-  protocol. CONTRIBUTING requires index/query PRs to link it and report
-  a run of that method, not timings with no host, corpus, or flags.
+  protocol. Dated machine runs live in
+  [docs/historical-benchmarks/](docs/historical-benchmarks/README.md)
+  (current: ASCII-fold UNIQUE prune is 1 candidate, 12.4 ms vs ripgrep
+  298 ms on this host). CONTRIBUTING requires index/query PRs to link
+  the protocol and report a run, not timings with no host, corpus, or
+  flags.
 
 ## [0.1.1]
 

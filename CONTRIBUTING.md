@@ -53,7 +53,10 @@ PRs that change index or query behaviour, or that claim a speed or memory
 improvement, must include a **Benchmark** section that links to
 [docs/BENCHMARKS.md](docs/BENCHMARKS.md) and reports a run of that
 protocol (host, corpus, prune `candidates` for a mixed-case literal via
-`rgx --stats --time`, wall time vs `ripgrep` when available).
+`rgx --stats --time`, wall time vs `ripgrep` when available). Link a
+file under [docs/historical-benchmarks/](docs/historical-benchmarks/README.md)
+when you check in a dated snapshot; do not treat those numbers as the
+project's published performance.
 `scripts/bench.sh` covers timing vs ripgrep; mixed-case prune is a
 one-hit fixture until the generator emits `needle_token_UNIQUE_*`.
 

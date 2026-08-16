@@ -20,6 +20,29 @@ stays useful is:
 
 Paste a short table of **your** run in the PR if it helps the reviewer.
 Do not treat those figures as the project's published performance.
+Dated runs from this machine live under
+[historical-benchmarks/](historical-benchmarks/README.md); they rot the
+same way. The latest file there is the **current** snapshot for this tree.
+
+## Current snapshot (this tree)
+
+ASCII-fold (`*2` magics), Windows, 24 logical CPUs, rustc 1.97.1,
+ripgrep 15.2.0, 8,000-file / 35.2 MiB synthetic corpus, stdout discarded,
+median of 5 warm queries. Full write-up:
+[historical-benchmarks/2026-08-16-ascii-fold.md](historical-benchmarks/2026-08-16-ascii-fold.md).
+
+| Pattern | Candidates | rgx wall | ripgrep wall |
+|---------|----------:|---------:|-------------:|
+| `needle_token_UNIQUE_8000` | **1** (was 8,000 before the fold) | 12.4 ms | 298 ms |
+| `sits here` | 1 | 10.8 ms | 290 ms |
+| `hello` | 8,000 | 493 ms | 652 ms |
+| `.` | unconstrained | 2,530 ms | 2,387 ms |
+
+Index: 299 MiB, **8.50×** corpus. Earlier snapshots:
+[0.1.0](historical-benchmarks/2026-08-15-v0.1.0.md) (UNIQUE 8,000 candidates,
+~101 MiB working set on a pruned query),
+[0.1.1](historical-benchmarks/2026-08-15-v0.1.1.md) (mmap load tax gone;
+UNIQUE still 8,000 candidates).
 
 ## Quick start
 
@@ -131,3 +154,5 @@ corpus generator that emits a mixed-case unique, JSON output from
 
 Do not commit `.rgx/` directories, generated corpora, or machine-local
 CSV dumps. `.gitignore` already excludes `/.rgx/` and `/rgx-corpus/`.
+Markdown snapshots under `docs/historical-benchmarks/` are the exception:
+they are dated runs, not a live scoreboard.
