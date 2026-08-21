@@ -21,9 +21,12 @@ candidates are read from disk, so search time scales with the number of
 - **Parallel by default**: Both query verification and index construction /
   updating use standard library `std::thread::scope` for multi-threaded
   concurrency without binding to any runtime.
-- **High-throughput buffered I/O**: Index tables (`lookup.dat`, `postings.dat`,
-  `files.dat`, `meta.dat`, `grams.dat`) are written via 64 KB `BufWriter`s and
-  read via memory mapping (`mmap`).
+- **Compact format**: Posting lists are delta + varint encoded, n-gram keys
+  are truncated to 40 bits (collisions only widen candidate sets — exact
+  regex verification is unaffected), and paths are stored root-relative.
+  Index tables (`lookup.dat`, `postings.dat`, `files.dat`, `meta.dat`,
+  `grams.dat`) are written via 64 KB `BufWriter`s and read via memory
+  mapping (`mmap`).
 - **Production file discovery**: Powered by the `ignore` crate (ripgrep ecosystem),
   supporting root and nested `.gitignore` files, glob negations (`!pattern`),
   `.git/info/exclude`, and custom `.rgxignore` files.
@@ -31,8 +34,8 @@ candidates are read from disk, so search time scales with the number of
   verification is always exact.
 - The index is ASCII case-folded, so case-insensitive queries (`-i`) prune
   correctly.
-- Corrupt or truncated indexes are detected at load time and reported as an
-  error (exit 2) instead of crashing. First builds write the index in place;
+- Corrupt or outdated indexes are detected at load time and rebuilt
+  transparently instead of crashing. First builds write the index in place;
   rebuilds write to a staging directory and atomically swap it in.
 - `--update` is incremental: unchanged files are never re-read or re-indexed.
   A per-file n-gram cache (`grams.dat`), keyed by `(mtime, size, content
@@ -83,33 +86,24 @@ $ rgx --json "hello|world" . | head -1
 
 ## Benchmarks
 
-Benchmarked against `ripgrep` and `grep` using `./scripts/bench.sh` on a synthetic corpus of **10,000 files (421 MB corpus, 366 MB index)** on macOS (best-of-5 runs, 2 warmups):
+Benchmarked against `ripgrep` and `grep` on a synthetic corpus of 10,000
+files (215 MB corpus, 156 MB index), best-of-5 runs:
 
-### Search Latency & Memory Usage
+- **Query speed**: **2.6× faster than `ripgrep`**, **53× faster than `grep`**
+  across 12 common/selective/rare patterns.
+- **Memory**: peak RSS of ~5 MB for selective/rare queries (up to 4× less
+  than `ripgrep`) — the index is memory-mapped and only candidate pages are
+  touched.
+- **Correctness**: match counts verified identical to both tools on every
+  pattern.
 
-| Pattern | Category | `rgx` Time | `ripgrep` Time | `grep` Time | `rgx` RSS | `ripgrep` RSS |
-|---|---|---|---|---|---|---|
-| `fn return` | Common | **60 ms** | 90 ms | 2,870 ms | **8.7 MB** | 20.8 MB |
-| `impl.*struct` | Common | **80 ms** | 100 ms | 3,010 ms | **19.9 MB** | 20.9 MB |
-| `match.*enum` | Common | **70 ms** | 100 ms | 3,030 ms | **18.8 MB** | 21.2 MB |
-| `HashMap.*BTreeMap` | Selective | **70 ms** | 80 ms | 2,800 ms | **5.1 MB** | 21.5 MB |
-| `async.*await` | Selective | **30 ms** | 80 ms | 2,910 ms | **5.5 MB** | 21.1 MB |
-| `serialize.*derive` | Selective | **40 ms** | 80 ms | 2,910 ms | **6.0 MB** | 21.2 MB |
-| `tokio.*spawn` | Selective | **30 ms** | 80 ms | 3,000 ms | **5.6 MB** | 21.6 MB |
-| `SENTINEL_XYZZY` | Rare | **70 ms** | 80 ms | 2,730 ms | **5.0 MB** | 21.5 MB |
-| `phant0m_thread` | Rare | **10 ms** | 80 ms | 2,920 ms | **6.1 MB** | 20.9 MB |
-| `zwj_codepoint.*QUUX` | Rare | **10 ms** | 80 ms | 2,760 ms | **5.7 MB** | 21.3 MB |
-| `nebula_vortex` | Rare | **10 ms** | 80 ms | 2,920 ms | **5.7 MB** | 21.3 MB |
-| `hyperdrive_init` | Rare | **10 ms** | 80 ms | 2,870 ms | **5.8 MB** | 20.9 MB |
+Full tables, methodology and environment: [benchmark.md](benchmark.md).
 
-### Summary
+Reproduce locally:
 
-- **Query Speed**: **490 ms** total across all benchmark patterns (**2.1× faster than `ripgrep`**, **70.9× faster than `grep`**).
-- **Memory Footprint**: Peak RSS of **5.0 – 6.1 MB** for selective/rare queries (up to **4× less memory than `ripgrep`**).
-- **Reproduce Locally**:
-  ```console
-  $ ./scripts/bench.sh
-  ```
+```console
+$ ./scripts/bench.sh
+```
 
 ## Install
 
@@ -176,15 +170,16 @@ Coverage is a developer aid and is never gated in CI.
 
 ## Index format
 
-Five files under `.rgx/`, all little-endian, versioned by magic bytes:
+Five files under `.rgx/`, all little-endian, versioned by magic bytes
+(`RGX*2`; older formats are rebuilt automatically):
 
 | file         | contents                                                        |
 |--------------|-----------------------------------------------------------------|
-| `lookup.dat` | header + sorted `(hash u64, postings-offset u64)` entries        |
-| `postings.dat`| header + length-prefixed sorted `u32` file-id lists              |
-| `files.dat`  | header + length-prefixed file paths (index == file id)           |
+| `lookup.dat` | header + sorted `(u40 hash, u40 postings-offset)` entries (10 B) |
+| `postings.dat`| header + delta-varint sorted `u32` file-id lists               |
+| `files.dat`  | header + indexed root + length-prefixed root-relative paths     |
 | `meta.dat`   | header + per-file `(path, mtime, size)` for change detection     |
-| `grams.dat`  | header + per-file `(path, mtime, size, content-hash, grams)` cache for incremental updates |
+| `grams.dat`  | header + varint per-file `(path, mtime, size, content-hash, grams)` cache for incremental updates |
 
 ## License
 

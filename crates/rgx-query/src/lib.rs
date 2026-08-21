@@ -5,7 +5,7 @@
 //! ```no_run
 //! # fn main() -> Result<(), Box<dyn std::error::Error>> {
 //! use rgx_index::{Index, ScanOptions, build_index};
-//! use rgx_query::{candidates, decompose};
+//! use rgx_query::{Candidates, candidates, decompose};
 //!
 //! let root = std::path::Path::new(".");
 //! let index_dir = root.join(".rgx");
@@ -13,10 +13,13 @@
 //! build_index(root, &index_dir, &ScanOptions::default(), &mut progress)?;
 //! let index = Index::open(&index_dir)?;
 //!
-//! let plan = decompose("fn main", true);
-//! let cands = candidates(&index, &plan)
-//!     .unwrap_or_else(|| (0..index.file_count() as u32).collect());
-//! println!("{} candidate files", cands.len());
+//! let plan = decompose("fn main");
+//! let n_cands = match candidates(&index, &plan) {
+//!     Candidates::All => index.file_count(),
+//!     Candidates::None => 0,
+//!     Candidates::Some(ids) => ids.len(),
+//! };
+//! println!("{n_cands} candidate files");
 //! # Ok(())
 //! # }
 //! ```
@@ -26,4 +29,6 @@
 
 pub mod query;
 
-pub use query::{Branch, QueryPlan, candidates, decompose, intersect_sorted, union_sorted};
+pub use query::{
+    Branch, Candidates, QueryPlan, candidates, decompose, intersect_sorted, union_sorted,
+};
