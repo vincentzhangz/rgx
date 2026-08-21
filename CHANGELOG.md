@@ -7,6 +7,46 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [0.2.0]
+
+### Fixed
+
+- **Case-folded index**: indexed content is now ASCII case-folded before
+  n-gram hashing, and the query planner folds extracted literals the same
+  way. Previously the index stored raw-case grams while queries folded,
+  so any query containing uppercase letters (e.g. `HashMap.*BTreeMap`) and
+  every `-i` query silently lost all index pruning and fell back to
+  verifying every file. Results were always correct; pruning now works.
+- **Absent patterns no longer scan the corpus**: `candidates()` now
+  distinguishes "no constraint" from "provably impossible". A pattern whose
+  covering n-grams exist nowhere in the index (e.g. a typo) is answered in
+  microseconds instead of triggering a full verification scan.
+
+### Changed
+
+- **Index format v2** (`RGX*2` magic bytes). Indexes built by older
+  versions are detected at open time and rebuilt transparently on first
+  use; results are unchanged.
+  - Posting lists are delta + LEB128 varint encoded (dense lists shrink
+    5–10×).
+  - N-gram hash keys are truncated to 40 bits: collisions only widen
+    candidate sets and exact regex verification is unaffected, while
+    `grams.dat` shrinks ~40% and `lookup.dat` entries drop from 16 to 10
+    bytes.
+  - Stored paths are root-relative, making indexes smaller and relocatable.
+- A corrupt or outdated index is rebuilt automatically instead of exiting
+  with code 2.
+
+### Performance
+
+- Build workers receive chunks of at least 64 files (up to 8× cores
+  workers), so a few large files no longer idle the remaining threads.
+- The scanner no longer opens every file twice: binary detection moved to
+  content read time, and walk metadata is reused instead of re-statting.
+- `--no-index` scans the tree once instead of twice.
+- Lookup entry count is cached at open; posting decode slices bounds-checked
+  reads once per list element instead of per access.
+
 ## [0.1.1]
 
 ### Fixed

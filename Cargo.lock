@@ -151,7 +151,7 @@ checksum = "d6f6ff9a378485b298a5286656da665ba74413d36db0979633275d2e708145d4"
 
 [[package]]
 name = "rgx"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "regex",
  "regex-syntax",
@@ -161,7 +161,7 @@ dependencies = [
 
 [[package]]
 name = "rgx-index"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "ignore",
  "memmap2",
@@ -170,7 +170,7 @@ dependencies = [
 
 [[package]]
 name = "rgx-query"
-version = "0.1.1"
+version = "0.2.0"
 dependencies = [
  "regex-syntax",
  "rgx-index",

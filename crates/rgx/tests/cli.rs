@@ -188,7 +188,7 @@ fn update_is_incremental() {
 }
 
 #[test]
-fn corrupt_index_exits_2_without_panic() {
+fn corrupt_index_is_rebuilt_transparently() {
     let root = fixture("corrupt");
     standard_fixture(&root);
     let (code, _, _) = run(&["hello", root.to_str().unwrap()]);
@@ -196,9 +196,11 @@ fn corrupt_index_exits_2_without_panic() {
     assert!(root.join(".rgx/lookup.dat").exists());
 
     fs::write(root.join(".rgx/lookup.dat"), b"garbage-not-a-lookup").unwrap();
-    let (code, _stdout, stderr) = run(&["hello", root.to_str().unwrap()]);
-    assert_eq!(code, 2, "corrupt index must be reported as an error");
-    assert!(stderr.contains("cannot load index"), "stderr: {stderr}");
+    // A corrupt or outdated index is detected at open time and rebuilt
+    // transparently; the search still succeeds.
+    let (code, stdout, _stderr) = run(&["hello", root.to_str().unwrap()]);
+    assert_eq!(code, 0, "corrupt index must be rebuilt automatically");
+    assert!(stdout.contains("hello"), "results after rebuild: {stdout}");
 }
 
 #[test]

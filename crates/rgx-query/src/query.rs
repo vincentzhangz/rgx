@@ -10,31 +10,55 @@ use regex_syntax::hir::literal::{ExtractKind, Extractor};
 use rgx_index::Index;
 use rgx_index::ngram::{MIN_NGRAM_LENGTH, covering_ngrams, ngram_hash};
 
+/// The candidate file set for a plan against an index.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Candidates {
+    /// The plan imposes no constraint; every indexed file is a candidate.
+    All,
+    /// Every literal branch is provably absent from the index, so no file
+    /// can contain a match. Verification can be skipped entirely.
+    None,
+    /// Explicit candidate file ids.
+    Some(Vec<u32>),
+}
+
 /// Compute the candidate file set for a plan against an index.
 ///
 /// Candidates are all files whose postings contain *every* covering n-gram
 /// of at least one prefix literal AND at least one suffix literal. Returns
-/// `None` when the plan imposes no constraint (every file is a candidate).
-pub fn candidates(index: &Index, plan: &QueryPlan) -> Option<Vec<u32>> {
+/// [`Candidates::All`] when the plan imposes no constraint.
+pub fn candidates(index: &Index, plan: &QueryPlan) -> Candidates {
     if plan.none || (plan.prefix.is_empty() && plan.suffix.is_empty()) {
-        return None;
+        return Candidates::All;
     }
-    let pref = side_candidates(index, &plan.prefix);
-    let suff = side_candidates(index, &plan.suffix);
-    match (pref, suff) {
-        (Some(a), Some(b)) => Some(intersect_sorted(&a, &b)),
-        (Some(a), None) => Some(a),
-        (None, Some(b)) => Some(b),
-        (None, None) => None,
+    use Side::{Empty, Set, Unconstrained};
+    match (
+        side_candidates(index, &plan.prefix),
+        side_candidates(index, &plan.suffix),
+    ) {
+        (Empty, _) | (_, Empty) => Candidates::None,
+        (Unconstrained, Unconstrained) => Candidates::All,
+        (Set(a), Set(b)) => Candidates::Some(intersect_sorted(&a, &b)),
+        (Set(a), Unconstrained) | (Unconstrained, Set(a)) => Candidates::Some(a),
     }
+}
+
+/// Result of evaluating one side (prefix or suffix) of a plan.
+enum Side {
+    /// No branches on this side; it imposes no constraint.
+    Unconstrained,
+    /// Every branch's n-gram conjunction is absent from the index.
+    Empty,
+    /// Union over branches of (intersection over each branch's n-grams).
+    Set(Vec<u32>),
 }
 
 /// Union over branches of (intersection over each branch's n-grams).
 /// Posting lists are fetched into reused buffers to avoid fresh
 /// allocations per gram.
-fn side_candidates(index: &Index, branches: &[Branch]) -> Option<Vec<u32>> {
+fn side_candidates(index: &Index, branches: &[Branch]) -> Side {
     if branches.is_empty() {
-        return None;
+        return Side::Unconstrained;
     }
     let mut post = Vec::new();
     let mut acc = Vec::new();
@@ -74,7 +98,10 @@ fn side_candidates(index: &Index, branches: &[Branch]) -> Option<Vec<u32>> {
             }
         }
     }
-    result
+    match result {
+        Some(v) => Side::Set(v),
+        None => Side::Empty,
+    }
 }
 
 /// Merge-intersect two sorted `u32` slices, appending to `out` (cleared first).
@@ -170,9 +197,9 @@ fn literal_bytes(lit: &regex_syntax::hir::literal::Literal) -> Vec<u8> {
 
 /// Decompose a regex pattern into a query plan.
 ///
-/// `fold_case` lowercases extracted literals so they match a case-folded
-/// index (used for both `-i` queries and folded indexes).
-pub fn decompose(pattern: &str, fold_case: bool) -> QueryPlan {
+/// Extracted literals are ASCII case-folded so they match the folded index;
+/// final case sensitivity is decided by exact regex verification.
+pub fn decompose(pattern: &str) -> QueryPlan {
     let hir = match regex_syntax::Parser::new().parse(pattern) {
         Ok(h) => h,
         Err(_) => {
@@ -189,14 +216,14 @@ pub fn decompose(pattern: &str, fold_case: bool) -> QueryPlan {
         .limit_total(128)
         .limit_class(16);
     let prefix_seq = ex.extract(&hir);
-    let prefix = branches(&prefix_seq, fold_case);
+    let prefix = branches(&prefix_seq);
 
     let mut exs = Extractor::new();
     exs.kind(ExtractKind::Suffix)
         .limit_total(128)
         .limit_class(16);
     let suffix_seq = exs.extract(&hir);
-    let suffix = branches(&suffix_seq, fold_case);
+    let suffix = branches(&suffix_seq);
 
     let none = prefix.is_empty() && suffix.is_empty();
 
@@ -207,7 +234,7 @@ pub fn decompose(pattern: &str, fold_case: bool) -> QueryPlan {
     }
 }
 
-fn branches(seq: &regex_syntax::hir::literal::Seq, fold_case: bool) -> Vec<Branch> {
+fn branches(seq: &regex_syntax::hir::literal::Seq) -> Vec<Branch> {
     if seq.is_empty() || !seq.is_finite() {
         return Vec::new();
     }
@@ -217,14 +244,10 @@ fn branches(seq: &regex_syntax::hir::literal::Seq, fold_case: bool) -> Vec<Branc
     };
     lits.iter()
         .map(|lit| {
-            let raw = literal_bytes(lit);
-            let lit_bytes = if fold_case {
-                raw.iter()
-                    .map(|b| b.to_ascii_lowercase())
-                    .collect::<Vec<u8>>()
-            } else {
-                raw.clone()
-            };
+            let lit_bytes: Vec<u8> = literal_bytes(lit)
+                .iter()
+                .map(|b| b.to_ascii_lowercase())
+                .collect();
             let mut grams = covering_ngrams(&lit_bytes, rgx_index::DEFAULT_MAX_NGRAM_LENGTH);
             grams.sort();
             grams.dedup();
@@ -252,7 +275,7 @@ mod tests {
 
     #[test]
     fn literal_pattern() {
-        let p = decompose("hello world", false);
+        let p = decompose("hello world");
         assert!(!p.none);
         let grams = grams_of(&p);
         let expect = ["hel", "ell", "llo", "rld", "worl", "lo wo"];
@@ -266,7 +289,7 @@ mod tests {
 
     #[test]
     fn alternation() {
-        let p = decompose("cat|dog", false);
+        let p = decompose("cat|dog");
         assert!(!p.none);
         let grams = grams_of(&p);
         assert!(grams.iter().any(|g| g.as_slice() == b"cat"));
@@ -275,19 +298,20 @@ mod tests {
 
     #[test]
     fn dot_wildcard_is_none() {
-        let p = decompose(".*", false);
+        let p = decompose(".*");
         assert!(p.none);
     }
 
     #[test]
-    fn case_folding() {
-        let p = decompose("Hello", true);
+    fn literals_always_case_folded() {
+        let p = decompose("Hello");
         let grams = grams_of(&p);
+        assert!(!grams.is_empty());
         for g in &grams {
-            assert!(g.iter().all(|b| !b.is_ascii_uppercase()));
+            assert!(
+                g.iter().all(|b| !b.is_ascii_uppercase()),
+                "gram {g:?} must be folded"
+            );
         }
-        let p2 = decompose("Hello", false);
-        let grams2 = grams_of(&p2);
-        assert!(grams2.iter().any(|g| g.contains(&b'H')));
     }
 }

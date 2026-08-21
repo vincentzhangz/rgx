@@ -22,5 +22,5 @@ path = "src/main.rs"
 [dependencies]
 regex = { workspace = true }
 regex-syntax = { workspace = true }
-rgx-index = { version = "0.1.1", path = "../rgx-index" }
-rgx-query = { version = "0.1.1", path = "../rgx-query" }
+rgx-index = { version = "0.2.0", path = "../rgx-index" }
+rgx-query = { version = "0.2.0", path = "../rgx-query" }

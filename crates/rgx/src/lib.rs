@@ -16,7 +16,7 @@ pub mod matcher;
 
 use matcher::{Match, match_content_str};
 use rgx_index::{Index, ScanOptions, build_index, update_index};
-use rgx_query::{candidates, decompose};
+use rgx_query::{Candidates, candidates, decompose};
 use std::io::Write;
 use std::path::PathBuf;
 use std::time::Instant;
@@ -35,7 +35,8 @@ pub struct Config {
     pub ignore_case: bool,
     /// Rebuild the index before searching (`--build`).
     pub build: bool,
-    /// Rebuild the index (`--update`; currently a full rebuild).
+    /// Incrementally update the index (`--update`; only changed files are
+    /// re-read).
     pub update: bool,
     /// Skip the index entirely (`--no-index`).
     pub no_index: bool,
@@ -128,10 +129,9 @@ fn execute_cfg(cfg: Config, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     let mut build_stats = None;
     let mut t_load = None;
 
-    let (index, file_ids): (Option<Index>, Vec<u32>) = if cfg.no_index {
+    let (index, scanned_files): (Option<Index>, Option<Vec<PathBuf>>) = if cfg.no_index {
         let t0 = Instant::now();
         let files = rgx_index::scanner::scan(&root_abs, &scan_opts(&cfg));
-        let ids = (0..files.len() as u32).collect();
         if cfg.time {
             let _ = writeln!(
                 err,
@@ -140,13 +140,14 @@ fn execute_cfg(cfg: Config, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
                 files.len()
             );
         }
-        (None, ids)
+        (None, Some(files))
     } else {
         let idx_dir = root_abs.join(INDEX_DIR_NAME);
         let index_missing = !idx_dir.join("lookup.dat").exists()
             || !idx_dir.join("postings.dat").exists()
             || !idx_dir.join("files.dat").exists();
 
+        let mut built_now = false;
         if cfg.build || cfg.update || index_missing {
             let t0 = Instant::now();
             let mut progress = |msg: &str| {
@@ -175,6 +176,7 @@ fn execute_cfg(cfg: Config, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
                         );
                     }
                     build_stats = Some(stats);
+                    built_now = true;
                 }
                 Err(e) => {
                     let _ = writeln!(err, "rgx: index build failed: {e}");
@@ -184,10 +186,28 @@ fn execute_cfg(cfg: Config, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         }
 
         let t0 = Instant::now();
-        match Index::open(&idx_dir) {
+        let opened = match Index::open(&idx_dir) {
+            Ok(idx) => Ok(idx),
+            // An index written by an older rgx (or a corrupt one) is
+            // rebuilt transparently once; a fresh build that still fails to
+            // open is a real error.
+            Err(e) if !built_now && e.kind() == std::io::ErrorKind::InvalidData => {
+                let _ = writeln!(err, "rgx: index format outdated; rebuilding");
+                let mut progress = |_: &str| {};
+                match build_index(&root_abs, &idx_dir, &scan_opts(&cfg), &mut progress) {
+                    Ok(stats) => {
+                        build_stats = Some(stats);
+                        Index::open(&idx_dir)
+                    }
+                    Err(e) => Err(e),
+                }
+            }
+            Err(e) => Err(e),
+        };
+        match opened {
             Ok(idx) => {
                 t_load = Some(t0.elapsed());
-                (Some(idx), Vec::new())
+                (Some(idx), None)
             }
             Err(e) => {
                 let _ = writeln!(err, "rgx: cannot load index at {}: {e}", idx_dir.display());
@@ -197,16 +217,20 @@ fn execute_cfg(cfg: Config, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
     };
 
     let t_plan = Instant::now();
-    let plan = decompose(&cfg.pattern, true);
+    let plan = decompose(&cfg.pattern);
     let mut t_cand = None;
     let cand_ids: Vec<u32> = match &index {
         Some(idx) => {
             let t0 = Instant::now();
             let c = candidates(idx, &plan);
             t_cand = Some(t0.elapsed());
-            c.unwrap_or_else(|| (0..idx.file_count() as u32).collect())
+            match c {
+                Candidates::All => (0..idx.file_count() as u32).collect(),
+                Candidates::None => Vec::new(),
+                Candidates::Some(ids) => ids,
+            }
         }
-        None => file_ids.clone(),
+        None => Vec::new(),
     };
     if cfg.time {
         let _ = writeln!(
@@ -234,15 +258,18 @@ fn execute_cfg(cfg: Config, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
         parallel_match(idx, &cand_ids, &re, cfg.json)
     } else {
         use std::io::Read;
-        let files = rgx_index::scanner::scan(&root_abs, &scan_opts(&cfg));
+        let files = scanned_files.as_deref().unwrap_or_default();
         let mut out = Vec::new();
         let mut file_buf = Vec::new();
-        for p in &files {
+        for p in files {
             let Ok(mut f) = std::fs::File::open(p) else {
                 continue;
             };
             file_buf.clear();
-            if f.read_to_end(&mut file_buf).is_ok() {
+            if f.read_to_end(&mut file_buf).is_ok()
+                && !file_buf.is_empty()
+                && !rgx_index::is_binary_content(&file_buf)
+            {
                 match_content_str(&re, &file_buf, &p.to_string_lossy(), cfg.json, &mut out);
             }
         }
@@ -286,6 +313,9 @@ fn execute_cfg(cfg: Config, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
                 s.index_bytes,
                 s.elapsed
             );
+            for (name, bytes) in &s.table_sizes {
+                let _ = writeln!(err, "rgx:   {name}: {bytes} bytes");
+            }
         }
         if let Some(idx) = &index {
             let _ = writeln!(
@@ -327,9 +357,12 @@ fn execute_cfg(cfg: Config, out: &mut dyn Write, err: &mut dyn Write) -> i32 {
 /// [`regex::Error`]. When the pattern yields no useful literals, every
 /// indexed file is treated as a candidate.
 pub fn search(index: &Index, pattern: &str, ignore_case: bool) -> Result<Vec<Match>, regex::Error> {
-    let plan = decompose(pattern, !ignore_case);
-    let cand_ids =
-        candidates(index, &plan).unwrap_or_else(|| (0..index.file_count() as u32).collect());
+    let plan = decompose(pattern);
+    let cand_ids = match candidates(index, &plan) {
+        Candidates::All => (0..index.file_count() as u32).collect(),
+        Candidates::None => Vec::new(),
+        Candidates::Some(ids) => ids,
+    };
     let re = regex::bytes::RegexBuilder::new(pattern)
         .case_insensitive(ignore_case)
         .build()?;
@@ -365,7 +398,7 @@ fn parallel_match(
                         let Some(path) = index.file_path(id) else {
                             continue;
                         };
-                        let Ok(mut file) = std::fs::File::open(path) else {
+                        let Ok(mut file) = std::fs::File::open(&path) else {
                             continue;
                         };
                         file_buf.clear();
@@ -411,25 +444,6 @@ fn write_json_escaped(w: &mut dyn Write, s: &str) -> std::io::Result<()> {
     w.write_all(&bytes[start..])?;
     w.write_all(b"\"")?;
     Ok(())
-}
-
-/// Escape a string for a JSON string literal.
-pub fn json_escape(s: &str) -> String {
-    let mut out = String::with_capacity(s.len() + 2);
-    out.push('"');
-    for c in s.chars() {
-        match c {
-            '"' => out.push_str("\\\""),
-            '\\' => out.push_str("\\\\"),
-            '\n' => out.push_str("\\n"),
-            '\r' => out.push_str("\\r"),
-            '\t' => out.push_str("\\t"),
-            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
-            c => out.push(c),
-        }
-    }
-    out.push('"');
-    out
 }
 
 /// Parse command-line arguments (program args, without the binary name).
@@ -526,12 +540,6 @@ mod tests {
         assert!(parse_args(vec!["--stats".into()]).is_err());
     }
 
-    #[test]
-    fn json_escaping() {
-        assert_eq!(json_escape("a\"b"), "\"a\\\"b\"");
-        assert_eq!(json_escape("line1\nline2"), "\"line1\\nline2\"");
-    }
-
     fn remove_all_retry(path: &std::path::Path) {
         for attempt in 0..5 {
             match std::fs::remove_dir_all(path) {
@@ -625,6 +633,45 @@ mod tests {
             matches.len(),
             2,
             "no-literal pattern must consider all files"
+        );
+    }
+
+    #[test]
+    fn folded_index_prunes_mixed_case_queries() {
+        let index = search_index(
+            "folded",
+            &[("a.txt", "Hello World\n"), ("b.txt", "nothing\n")],
+        );
+        // Case-sensitive query with uppercase literals: the folded index
+        // must still produce a pruned candidate set, not fall back to all
+        // files.
+        let plan = decompose("Hello");
+        assert!(!plan.none);
+        match candidates(&index, &plan) {
+            Candidates::Some(ids) => {
+                assert_eq!(ids.len(), 1, "must prune to the matching file only");
+            }
+            other => panic!("mixed-case query must prune via the folded index, got {other:?}"),
+        }
+        assert!(search(&index, "Hello", false).unwrap().len() == 1);
+        assert!(search(&index, "hello", true).unwrap().len() == 1);
+        assert!(search(&index, "HELLO", false).unwrap().is_empty());
+    }
+
+    #[test]
+    fn absent_pattern_yields_empty_candidates() {
+        let index = search_index("absent", &[("a.txt", "some content here\n")]);
+        // A pattern whose covering grams exist nowhere must report
+        // Candidates::None (skip verification entirely), not All.
+        let plan = decompose("qqqzzzxxxwww_typo_pattern");
+        match candidates(&index, &plan) {
+            Candidates::None => {}
+            other => panic!("absent pattern must yield no candidates, got {other:?}"),
+        }
+        assert!(
+            search(&index, "qqqzzzxxxwww_typo_pattern", false)
+                .unwrap()
+                .is_empty()
         );
     }
 }

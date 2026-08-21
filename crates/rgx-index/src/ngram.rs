@@ -42,10 +42,24 @@ pub fn hash_bigram(s: &[u8]) -> u32 {
     (a + (!a >> 47)) as u32
 }
 
-/// 64-bit hash of a variable-length n-gram, used as the inverted-index key.
+/// Bit width of an n-gram hash key. Hashes are truncated to 40 bits so
+/// index tables stay compact (5-byte keys on disk). At D distinct grams the
+/// expected number of colliding pairs is `D^2 / 2^41`: ~4.5K pairs at
+/// D = 100M and ~0.05% of grams affected even at D = 1B (global code-search
+/// scale). A collision only merges two posting lists, widening the candidate
+/// set; verification with the real regex is always exact, so results are
+/// never wrong — just occasionally verified against a few extra files.
+pub const NGRAM_HASH_BITS: u32 = 40;
+
+/// Mask applied to raw FNV-1a output to produce [`NGRAM_HASH_BITS`] keys.
+const NGRAM_HASH_MASK: u64 = (1 << NGRAM_HASH_BITS) - 1;
+
+/// Hash of a variable-length n-gram, used as the inverted-index key.
 ///
-/// FNV-1a over the n-gram bytes. Collisions only ever *broaden* a posting
-/// list (never produce a false negative), so a plain hash is sound.
+/// FNV-1a over the n-gram bytes, truncated to [`NGRAM_HASH_BITS`] bits.
+/// Both the indexer and the query planner call this same function, so the
+/// two sides always agree. Collisions only ever *broaden* a posting list
+/// (never produce a false negative), so a plain truncated hash is sound.
 #[inline]
 pub fn ngram_hash(bytes: &[u8]) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
@@ -53,7 +67,7 @@ pub fn ngram_hash(bytes: &[u8]) -> u64 {
         h ^= b as u64;
         h = h.wrapping_mul(0x100000001b3);
     }
-    h
+    h & NGRAM_HASH_MASK
 }
 
 /// Emit every sparse n-gram of `s` (indexing). O(n), at most `2n-2` grams.
@@ -229,6 +243,23 @@ mod tests {
             let cov = covering(s);
             assert!(cov.iter().all(|g| g.len() >= MIN_NGRAM_LENGTH));
             assert!(cov.len() <= s.len().saturating_sub(2));
+        }
+    }
+
+    #[test]
+    fn hashes_fit_truncated_width() {
+        let mut rng = Lcg(0xfeed);
+        for _ in 0..10_000 {
+            let len = (rng.next() % 64) as usize + 3;
+            let s = random_text(&mut rng, len);
+            for g in all_ngrams(&s) {
+                assert!(
+                    ngram_hash(&g) < (1 << NGRAM_HASH_BITS),
+                    "hash {:#x} exceeds {} bits",
+                    ngram_hash(&g),
+                    NGRAM_HASH_BITS
+                );
+            }
         }
     }
 

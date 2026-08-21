@@ -1,50 +1,61 @@
 //! On-disk inverted index: build, save, load (mmap) and query.
 //!
-//! Layout inside `<root>/.rgx/` (all little-endian):
+//! Layout inside `<root>/.rgx/` (all little-endian, varints are LEB128):
 //!
-//! * `lookup.dat`  — `"RGXLOOK1"` + `u64 count` + sorted entries of
-//!   `(u64 ngram_hash, u64 postings_offset)`, 16 bytes each. Mmap'd and
+//! * `lookup.dat`  — `"RGXLOOK2"` + `u64 count` + sorted entries of
+//!   `(u40 ngram_hash, u40 postings_offset)`, 10 bytes each. Mmap'd and
 //!   binary-searched. Offset is absolute into `postings.dat`.
-//! * `postings.dat`— `"RGXPOST1"` + `u64 count` + `u64 total_ids` + posting
-//!   lists. Each list is `u32 id_count` followed by `id_count` sorted `u32`
-//!   file ids. Mmap'd; lists are located by lookup offsets.
-//! * `files.dat`   — `"RGXFILS1"` + `u64 count` + `u64 len` + path bytes,
-//!   repeated. File id = sequence index (0-based).
-//! * `meta.dat`    — `"RGXMETA1"` + `u64 count` + `u64 plen` + path +
-//!   `u64 mtime` + `u64 size`, repeated. Same order as `files.dat`; used for
-//!   change detection.
-//! * `grams.dat`   — `"RGXGRAM1"` + `u64 count` + per-file records of
-//!   `(plen, path, mtime, size, content_hash u128, gram_count, grams...)`.
+//! * `postings.dat`— `"RGXPOST2"` + `u64 distinct` + `u64 total_ids` +
+//!   posting lists back-to-back. Each list is `varint id_count` followed by
+//!   `id_count` delta-varint sorted `u32` file ids (first id absolute, then
+//!   gaps). Mmap'd; lists are located by lookup offsets.
+//! * `files.dat`   — `"RGXFILS2"` + `u64 root_len` + root path bytes +
+//!   `u64 count` + length-prefixed root-relative paths. Stored paths are
+//!   relative to the indexed root; [`Index::file_path`] joins the root back
+//!   on, so results stay absolute. File id = sequence index (0-based).
+//! * `meta.dat`    — `"RGXMETA2"` + `u64 count` + length-prefixed
+//!   root-relative path + `u64 mtime` + `u64 size`, repeated. Same order as
+//!   `files.dat`; used for change detection.
+//! * `grams.dat`   — `"RGXGRAM2"` + `u64 count` + per-file records of
+//!   `(varint plen, path, varint mtime, varint size, content_hash u128,
+//!   varint gram_count, delta-varint grams...)`, paths root-relative.
 //!   A per-file n-gram cache keyed by `(mtime, size, content_hash)`; this is
 //!   what makes `--update` incremental (unchanged files are never re-read).
 //!   Corrupt or missing `grams.dat` simply triggers a full rebuild.
 //!
-//! The keyed n-gram hash is `ngram_hash` (FNV-1a over the gram bytes).
-//! Hash collisions can only broaden a posting list, never cause a false
-//! negative, so no collision handling is required.
+//! Indexed content is ASCII case-folded before n-gram hashing, and the query
+//! planner folds extracted literals the same way, so `-i` queries prune
+//! correctly; final case sensitivity is decided by exact regex verification.
+//!
+//! The keyed n-gram hash is `ngram_hash` (FNV-1a truncated to
+//! [`NGRAM_HASH_BITS`] bits over the folded gram bytes). Hash collisions can
+//! only broaden a posting list, never cause a false negative, so no
+//! collision handling is required.
 //!
 //! Builds are safe against Windows antivirus locks: a first build writes the
-//! tables directly into `.rgx/` (no rename), while a rebuild stages the new
-//! tables in `.rgx.tmp/` and atomically swaps them in (retrying transient
+//! index in place (no rename), while a rebuild stages the new tables in
+//! `.rgx.tmp/` and atomically swaps them in (retrying transient
 //! `ERROR_ACCESS_DENIED` renames with backoff).
 
 use crate::fingerprint::content_hash;
-use crate::ngram::{MIN_NGRAM_LENGTH, build_all_ngrams, ngram_hash};
-use crate::scanner::{ScanOptions, scan};
+use crate::ngram::{MIN_NGRAM_LENGTH, NGRAM_HASH_BITS, build_all_ngrams, ngram_hash};
+use crate::scanner::{ScanOptions, is_binary_content, scan};
 use memmap2::Mmap;
 use std::collections::HashMap;
 use std::fs::{self, File};
 use std::io::{BufWriter, Seek, SeekFrom, Write};
+#[cfg(unix)]
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, SyncSender, sync_channel};
 use std::time::UNIX_EPOCH;
 
-const POSTINGS_HEADER: &[u8] = b"RGXPOST1";
-const LOOKUP_HEADER: &[u8] = b"RGXLOOK1";
-const FILES_HEADER: &[u8] = b"RGXFILS1";
-const META_HEADER: &[u8] = b"RGXMETA1";
-const GRAMS_HEADER: &[u8] = b"RGXGRAM1";
+const POSTINGS_HEADER: &[u8] = b"RGXPOST2";
+const LOOKUP_HEADER: &[u8] = b"RGXLOOK2";
+const FILES_HEADER: &[u8] = b"RGXFILS2";
+const META_HEADER: &[u8] = b"RGXMETA2";
+const GRAMS_HEADER: &[u8] = b"RGXGRAM2";
 
 /// Header layout: 8 magic bytes + 8 count bytes = 16.
 const HEADER_LEN: usize = 16;
@@ -52,11 +63,11 @@ const HEADER_LEN: usize = 16;
 /// The count field within the 16-byte header.
 const COUNT_OFFSET: usize = 8;
 
-/// A `(hash, offset)` lookup entry: 16 bytes.
-const ENTRY_LEN: usize = 16;
+/// A `(hash, offset)` lookup entry: 5-byte hash + 5-byte offset.
+const LOOKUP_ENTRY_LEN: usize = 10;
 
-/// postings.dat has a third header field (`total_ids`), so its payload
-/// starts 8 bytes later than the generic 16-byte header.
+/// postings.dat has two extra header fields (`distinct`, `total_ids`) after
+/// its 8-byte magic, so its payload starts at 8 + 8 + 8 = 24.
 const POSTINGS_DATA_OFFSET: u64 = (HEADER_LEN + 8) as u64;
 
 /// Buffer capacity for writing index files (64 KB).
@@ -67,10 +78,71 @@ const INDEX_WRITE_BUF_CAPACITY: usize = 64 * 1024;
 /// whole corpus's n-grams in RAM again.
 const STREAM_CHANNEL_CAPACITY: usize = 64;
 
+/// Smallest number of files handed to one build worker. Finer chunks than
+/// one-per-core balance load when file sizes vary widely.
+const WORKER_CHUNK_MIN_FILES: usize = 64;
+
+/// Upper bound on build workers, as a multiple of available cores. Keeps
+/// thread counts sane while still allowing chunks finer than one-per-core.
+const WORKER_THREAD_MULTIPLIER: usize = 8;
+
+/// Append `v` to `buf` as LEB128.
+fn push_varint(buf: &mut Vec<u8>, mut v: u64) {
+    loop {
+        let byte = (v & 0x7f) as u8;
+        v >>= 7;
+        if v == 0 {
+            buf.push(byte);
+            return;
+        }
+        buf.push(byte | 0x80);
+    }
+}
+
+/// Read a LEB128 varint from `data` starting at `*pos`, advancing it.
+fn read_varint(data: &[u8], pos: &mut usize) -> Option<u64> {
+    let mut v = 0u64;
+    let mut shift = 0u32;
+    loop {
+        let b = *data.get(*pos)?;
+        *pos += 1;
+        v |= ((b & 0x7f) as u64) << shift;
+        if b & 0x80 == 0 {
+            return Some(v);
+        }
+        shift += 7;
+        if shift > 63 {
+            return None;
+        }
+    }
+}
+
+/// Read a 5-byte little-endian value.
+fn u40_at(data: &[u8], at: usize) -> Option<u64> {
+    let s = data.get(at..at + 5)?;
+    Some(
+        s[0] as u64
+            | (s[1] as u64) << 8
+            | (s[2] as u64) << 16
+            | (s[3] as u64) << 24
+            | (s[4] as u64) << 32,
+    )
+}
+
+/// Append `v` as 5 bytes of `buf` at `at` (little-endian).
+fn put_u40(buf: &mut [u8], at: usize, v: u64) {
+    debug_assert!(v < (1 << NGRAM_HASH_BITS) || at == 5, "value overflow");
+    buf[at] = v as u8;
+    buf[at + 1] = (v >> 8) as u8;
+    buf[at + 2] = (v >> 16) as u8;
+    buf[at + 3] = (v >> 24) as u8;
+    buf[at + 4] = (v >> 32) as u8;
+}
+
 /// A file known to the index.
 #[derive(Clone, Debug)]
 pub struct FileEntry {
-    /// Absolute path of the file.
+    /// Path of the file, relative to the indexed root.
     pub path: PathBuf,
     /// Last-modified time in whole seconds since the Unix epoch.
     pub mtime: u64,
@@ -79,7 +151,8 @@ pub struct FileEntry {
 }
 
 /// A cached per-file n-gram entry loaded from `grams.dat`, used to skip
-/// re-reading unchanged files during `--update`.
+/// re-reading unchanged files during `--update`. Keys are root-relative
+/// paths.
 #[derive(Clone, Debug)]
 struct CachedGrams {
     /// Last-modified time in whole seconds since the Unix epoch.
@@ -95,8 +168,8 @@ struct CachedGrams {
 
 /// One file processed by a worker thread, streamed to the merge loop.
 struct ProcessedFile {
-    /// Absolute path of the file (stored once; grams.dat and files.dat are
-    /// both written from it).
+    /// Path of the file relative to the indexed root (stored once;
+    /// grams.dat and files.dat are both written from it).
     path: PathBuf,
     /// Last-modified time in whole seconds since the Unix epoch.
     mtime: u64,
@@ -128,6 +201,8 @@ pub struct BuildStats {
     /// Files reused from the previous `grams.dat` (not re-read) in an
     /// incremental update.
     pub reused_files: usize,
+    /// On-disk size of each index table, for `--stats`.
+    pub table_sizes: Vec<(&'static str, u64)>,
 }
 
 /// Build an index for the tree at `root` into `index_dir` (usually
@@ -180,7 +255,7 @@ fn run_build(
     progress(&format!("scanning: {} files", n));
 
     let (target, staged) = prepare_index_dir(index_dir)?;
-    let receivers = spawn_workers(&files, cache.as_ref());
+    let receivers = spawn_workers(&files, root, cache.as_ref());
     let mut merged = merge_stream(&receivers, &target)?;
 
     progress(&format!(
@@ -190,7 +265,9 @@ fn run_build(
     ));
     progress("writing index files");
     merged.postings.sort_unstable();
-    let index_bytes = write_tables(&target, &merged.postings, &merged.entries)? + merged.gram_bytes;
+    let mut table_sizes = write_tables(&target, root, &merged.postings, &merged.entries)?;
+    table_sizes.push(("grams.dat", merged.gram_bytes));
+    let index_bytes = table_sizes.iter().map(|(_, b)| b).sum::<u64>();
     if staged {
         publish_index(&target, index_dir)?;
     }
@@ -203,6 +280,7 @@ fn run_build(
         index_bytes,
         elapsed: started.elapsed(),
         reused_files: merged.reused,
+        table_sizes,
     })
 }
 
@@ -222,31 +300,40 @@ fn prepare_index_dir(index_dir: &Path) -> std::io::Result<(PathBuf, bool)> {
     }
 }
 
-/// Spawn one worker per chunk of the file list. Each worker sends its
-/// records through a bounded channel; the returned receivers are in chunk
-/// order so the merge loop sees files in scan order.
+/// Spawn one worker per chunk of the file list. Chunks are finer than
+/// one-per-core (bounded by [`WORKER_THREAD_MULTIPLIER`]×cores, at least
+/// [`WORKER_CHUNK_MIN_FILES`] files each) so a few large files cannot idle
+/// the remaining workers. Each worker sends its records through a bounded
+/// channel; the returned receivers are in chunk order so the merge loop
+/// sees files in scan order.
 fn spawn_workers(
     files: &Arc<Vec<PathBuf>>,
+    root: &Path,
     cache: Option<&Arc<HashMap<PathBuf, CachedGrams>>>,
 ) -> Vec<Receiver<ProcessedFile>> {
-    let threads = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4)
-        .max(1);
     let mut receivers = Vec::new();
     if files.is_empty() {
         return receivers;
     }
-    let chunk_size = files.len().div_ceil(threads).max(1);
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(4)
+        .max(1);
+    let max_threads = cores * WORKER_THREAD_MULTIPLIER;
+    let chunk_size = files
+        .len()
+        .div_ceil(max_threads)
+        .max(WORKER_CHUNK_MIN_FILES);
     let mut start = 0usize;
     for chunk in files.chunks(chunk_size) {
         let (tx, rx) = sync_channel(STREAM_CHANNEL_CAPACITY);
         let end = start + chunk.len();
         let files = Arc::clone(files);
         let cache = cache.cloned();
+        let root = root.to_path_buf();
         std::thread::spawn(move || {
             for i in start..end {
-                if process_file(&files[i], cache.as_deref(), &tx).is_err() {
+                if process_file(&files[i], &root, cache.as_deref(), &tx).is_err() {
                     break;
                 }
             }
@@ -257,24 +344,41 @@ fn spawn_workers(
     receivers
 }
 
+/// Path of `path` relative to the index `root`. Paths outside the root
+/// (possible via followed symlinks) fall back to the absolute path;
+/// `Path::join` with an absolute argument reproduces it unchanged.
+fn rel_key(path: &Path, root: &Path) -> PathBuf {
+    path.strip_prefix(root).unwrap_or(path).to_path_buf()
+}
+
 /// Read (or reuse the cached grams of) one file and send it downstream.
-/// Unreadable files are skipped, as in previous versions.
+/// Unreadable, empty or binary files are skipped; per-file errors never
+/// abort the rest of a worker's chunk.
 fn process_file(
     path: &Path,
+    root: &Path,
     cache: Option<&HashMap<PathBuf, CachedGrams>>,
     tx: &SyncSender<ProcessedFile>,
 ) -> std::io::Result<()> {
-    let meta = fs::metadata(path)?;
+    let Ok(meta) = fs::metadata(path) else {
+        return Ok(());
+    };
     let mtime = mtime_secs(&meta);
     let size = meta.len();
 
-    let cached = cache.and_then(|c| c.get(path));
+    let rel = rel_key(path, root);
+    let cached = cache.and_then(|c| c.get(&rel));
     let (content_hash, grams, bytes_read, reused) = match cached {
         Some(c) if c.mtime == mtime && c.size == size => {
             (c.content_hash, Arc::clone(&c.grams), 0, true)
         }
         Some(c) => {
-            let content = fs::read(path)?;
+            let Ok(content) = fs::read(path) else {
+                return Ok(());
+            };
+            if content.is_empty() || is_binary_content(&content) {
+                return Ok(());
+            }
             let hash = content_hash(&content);
             let grams: Arc<[u64]> = if hash == c.content_hash {
                 Arc::clone(&c.grams)
@@ -284,7 +388,12 @@ fn process_file(
             (hash, grams, content.len() as u64, hash == c.content_hash)
         }
         None => {
-            let content = fs::read(path)?;
+            let Ok(content) = fs::read(path) else {
+                return Ok(());
+            };
+            if content.is_empty() || is_binary_content(&content) {
+                return Ok(());
+            }
             let hash = content_hash(&content);
             let bytes = content.len() as u64;
             (hash, Arc::from(file_grams(&content)), bytes, false)
@@ -292,7 +401,7 @@ fn process_file(
     };
 
     tx.send(ProcessedFile {
-        path: path.to_path_buf(),
+        path: rel,
         mtime,
         size,
         content_hash,
@@ -377,6 +486,8 @@ fn merge_stream(receivers: &[Receiver<ProcessedFile>], target: &Path) -> std::io
 struct GramsWriter {
     file: BufWriter<File>,
     count: u64,
+    /// Reusable encode buffer, sized to the largest record seen.
+    scratch: Vec<u8>,
 }
 
 impl GramsWriter {
@@ -384,20 +495,29 @@ impl GramsWriter {
         let mut file = BufWriter::with_capacity(INDEX_WRITE_BUF_CAPACITY, File::create(path)?);
         file.write_all(GRAMS_HEADER)?;
         file.write_all(&0u64.to_le_bytes())?;
-        Ok(GramsWriter { file, count: 0 })
+        Ok(GramsWriter {
+            file,
+            count: 0,
+            scratch: Vec::new(),
+        })
     }
 
     fn write(&mut self, p: &ProcessedFile) -> std::io::Result<()> {
+        let buf = &mut self.scratch;
+        buf.clear();
         let path = p.path.to_string_lossy();
-        self.file.write_all(&(path.len() as u64).to_le_bytes())?;
-        self.file.write_all(path.as_bytes())?;
-        self.file.write_all(&p.mtime.to_le_bytes())?;
-        self.file.write_all(&p.size.to_le_bytes())?;
-        self.file.write_all(&p.content_hash.to_le_bytes())?;
-        self.file.write_all(&(p.grams.len() as u64).to_le_bytes())?;
-        for h in p.grams.iter() {
-            self.file.write_all(&h.to_le_bytes())?;
+        push_varint(buf, path.len() as u64);
+        buf.extend_from_slice(path.as_bytes());
+        push_varint(buf, p.mtime);
+        push_varint(buf, p.size);
+        buf.extend_from_slice(&p.content_hash.to_le_bytes());
+        push_varint(buf, p.grams.len() as u64);
+        let mut prev = 0u64;
+        for &h in p.grams.iter() {
+            push_varint(buf, h - prev);
+            prev = h;
         }
+        self.file.write_all(buf)?;
         self.count += 1;
         Ok(())
     }
@@ -413,9 +533,13 @@ impl GramsWriter {
 }
 
 /// Collect the distinct n-grams of a file's content (length >= 3).
+///
+/// Content is ASCII case-folded first so the index is case-insensitive at
+/// the gram level; the query planner folds extracted literals identically.
 fn file_grams(content: &[u8]) -> Vec<u64> {
+    let folded = content.to_ascii_lowercase();
     let mut ids = Vec::new();
-    build_all_ngrams(content, &mut |gram| {
+    build_all_ngrams(&folded, &mut |gram| {
         if gram.len() >= MIN_NGRAM_LENGTH {
             ids.push(ngram_hash(gram));
         }
@@ -439,14 +563,21 @@ fn distinct_grams(flat: &[Posting]) -> usize {
     distinct
 }
 
-/// Write the four non-grams tables (grams.dat is already streamed) for `dir`.
-/// `postings` must be sorted by `(gram, file_id)`. Returns the total size of
-/// those four files.
+/// Write the four non-grams tables (grams.dat is already streamed) for
+/// `dir`. `postings` must be sorted by `(gram, file_id)`. Returns the name
+/// and size of each of those four files.
 ///
-/// A first build writes into `dir` directly; rebuilds pass the staging
-/// directory that [`publish_index`] later swaps in.
-fn write_tables(dir: &Path, postings: &[Posting], entries: &[FileEntry]) -> std::io::Result<u64> {
+/// Posting lists are delta-varint encoded; `lookup.dat` records the byte
+/// offset of each list. A first build writes into `dir` directly; rebuilds
+/// pass the staging directory that [`publish_index`] later swaps in.
+fn write_tables(
+    dir: &Path,
+    root: &Path,
+    postings: &[Posting],
+    entries: &[FileEntry],
+) -> std::io::Result<Vec<(&'static str, u64)>> {
     let distinct = distinct_grams(postings);
+    let mut scratch: Vec<u8> = Vec::new();
 
     let mut pfile = std::io::BufWriter::with_capacity(
         INDEX_WRITE_BUF_CAPACITY,
@@ -455,6 +586,8 @@ fn write_tables(dir: &Path, postings: &[Posting], entries: &[FileEntry]) -> std:
     pfile.write_all(POSTINGS_HEADER)?;
     pfile.write_all(&(distinct as u64).to_le_bytes())?;
     pfile.write_all(&(postings.len() as u64).to_le_bytes())?;
+    let mut lookup_entries: Vec<(u64, u64)> = Vec::with_capacity(distinct);
+    let mut offset = POSTINGS_DATA_OFFSET;
     let mut i = 0;
     while i < postings.len() {
         let gram = postings[i].gram();
@@ -462,11 +595,18 @@ fn write_tables(dir: &Path, postings: &[Posting], entries: &[FileEntry]) -> std:
         while j < postings.len() && postings[j].gram() == gram {
             j += 1;
         }
-        pfile.write_all(&((j - i) as u32).to_le_bytes())?;
+        scratch.clear();
+        push_varint(&mut scratch, (j - i) as u64);
+        let mut prev = 0u64;
         for p in &postings[i..j] {
             debug_assert_eq!(p.gram(), gram);
-            pfile.write_all(&p.file_id().to_le_bytes())?;
+            debug_assert!(p.file_id() as u64 >= prev, "posting ids must ascend");
+            push_varint(&mut scratch, p.file_id() as u64 - prev);
+            prev = p.file_id() as u64;
         }
+        lookup_entries.push((gram, offset));
+        offset += scratch.len() as u64;
+        pfile.write_all(&scratch)?;
         i = j;
     }
     pfile.flush()?;
@@ -479,35 +619,41 @@ fn write_tables(dir: &Path, postings: &[Posting], entries: &[FileEntry]) -> std:
     );
     lfile.write_all(LOOKUP_HEADER)?;
     lfile.write_all(&(distinct as u64).to_le_bytes())?;
-    let mut offset: u64 = POSTINGS_DATA_OFFSET;
-    let mut i = 0;
-    while i < postings.len() {
-        let gram = postings[i].gram();
-        let mut j = i;
-        while j < postings.len() && postings[j].gram() == gram {
-            j += 1;
-        }
-        lfile.write_all(&gram.to_le_bytes())?;
-        lfile.write_all(&offset.to_le_bytes())?;
-        offset += 4 + (j - i) as u64 * 4;
-        i = j;
+    scratch.clear();
+    scratch.reserve(lookup_entries.len() * LOOKUP_ENTRY_LEN);
+    for (hash, off) in &lookup_entries {
+        let at = scratch.len();
+        scratch.resize(at + LOOKUP_ENTRY_LEN, 0);
+        put_u40(&mut scratch, at, *hash);
+        put_u40(&mut scratch, at + 5, *off);
     }
+    lfile.write_all(&scratch)?;
     lfile.flush()?;
     let lookup_bytes = lfile.get_ref().metadata()?.len();
     drop(lfile);
 
-    write_path_table(dir.join("files.dat"), FILES_HEADER, entries)?;
+    write_path_table(dir.join("files.dat"), FILES_HEADER, root, entries)?;
     write_meta_table(dir.join("meta.dat"), entries)?;
 
-    Ok(postings_bytes
-        + lookup_bytes
-        + fs::metadata(dir.join("files.dat"))?.len()
-        + fs::metadata(dir.join("meta.dat"))?.len())
+    Ok(vec![
+        ("postings.dat", postings_bytes),
+        ("lookup.dat", lookup_bytes),
+        ("files.dat", fs::metadata(dir.join("files.dat"))?.len()),
+        ("meta.dat", fs::metadata(dir.join("meta.dat"))?.len()),
+    ])
 }
 
-fn write_path_table(path: PathBuf, magic: &[u8], entries: &[FileEntry]) -> std::io::Result<()> {
+fn write_path_table(
+    path: PathBuf,
+    magic: &[u8],
+    root: &Path,
+    entries: &[FileEntry],
+) -> std::io::Result<()> {
     let mut f = std::io::BufWriter::with_capacity(INDEX_WRITE_BUF_CAPACITY, File::create(path)?);
     f.write_all(magic)?;
+    let root_s = root.to_string_lossy();
+    f.write_all(&(root_s.len() as u64).to_le_bytes())?;
+    f.write_all(root_s.as_bytes())?;
     f.write_all(&(entries.len() as u64).to_le_bytes())?;
     for e in entries {
         let p = e.path.to_string_lossy();
@@ -533,8 +679,8 @@ fn write_meta_table(path: PathBuf, entries: &[FileEntry]) -> std::io::Result<()>
     Ok(())
 }
 
-/// Load the per-file n-gram cache keyed by path. Returns `None` when
-/// missing or corrupt (the caller falls back to a full rebuild).
+/// Load the per-file n-gram cache keyed by root-relative path. Returns
+/// `None` when missing or corrupt (the caller falls back to a full rebuild).
 fn load_grams_cache(path: &Path) -> Option<HashMap<PathBuf, CachedGrams>> {
     use std::io::Read;
     let file = File::open(path).ok()?;
@@ -547,36 +693,40 @@ fn load_grams_cache(path: &Path) -> Option<HashMap<PathBuf, CachedGrams>> {
     let count = u64::from_le_bytes(hdr[8..16].try_into().ok()?) as usize;
     let mut out = HashMap::with_capacity(count);
     let mut path_buf = Vec::new();
-    let mut num_buf = [0u8; 8];
     let mut hash_buf = [0u8; 16];
 
+    macro_rules! vread {
+        () => {
+            match read_varint_from(&mut reader) {
+                Some(v) => v,
+                None => return None,
+            }
+        };
+    }
+
     for _ in 0..count {
-        reader.read_exact(&mut num_buf).ok()?;
-        let plen = u64::from_le_bytes(num_buf) as usize;
+        let plen = vread!() as usize;
         path_buf.resize(plen, 0);
         reader.read_exact(&mut path_buf).ok()?;
-        let path = String::from_utf8_lossy(&path_buf).into_owned();
+        let rel = String::from_utf8_lossy(&path_buf).into_owned();
 
-        reader.read_exact(&mut num_buf).ok()?;
-        let mtime = u64::from_le_bytes(num_buf);
-
-        reader.read_exact(&mut num_buf).ok()?;
-        let size = u64::from_le_bytes(num_buf);
+        let mtime = vread!();
+        let size = vread!();
 
         reader.read_exact(&mut hash_buf).ok()?;
         let content_hash = u128::from_le_bytes(hash_buf);
 
-        reader.read_exact(&mut num_buf).ok()?;
-        let gcount = u64::from_le_bytes(num_buf) as usize;
+        let gcount = vread!() as usize;
 
-        let mut grams = Vec::with_capacity(gcount);
+        let mut grams = Vec::with_capacity(gcount.min(1 << 20));
+        let mut prev = 0u64;
         for _ in 0..gcount {
-            reader.read_exact(&mut num_buf).ok()?;
-            grams.push(u64::from_le_bytes(num_buf));
+            prev += vread!();
+            grams.push(prev);
         }
 
         out.insert(
-            PathBuf::from(path),
+            PathBuf::from(rel),
             CachedGrams {
                 mtime,
                 size,
@@ -586,6 +736,25 @@ fn load_grams_cache(path: &Path) -> Option<HashMap<PathBuf, CachedGrams>> {
         );
     }
     Some(out)
+}
+
+/// Read a LEB128 varint from an `io::Read` stream.
+fn read_varint_from<R: std::io::Read>(reader: &mut R) -> Option<u64> {
+    let mut byte = [0u8; 1];
+    let mut v = 0u64;
+    let mut shift = 0u32;
+    loop {
+        reader.read_exact(&mut byte).ok()?;
+        let b = byte[0];
+        v |= ((b & 0x7f) as u64) << shift;
+        if b & 0x80 == 0 {
+            return Some(v);
+        }
+        shift += 7;
+        if shift > 63 {
+            return None;
+        }
+    }
 }
 
 fn mtime_secs(meta: &fs::Metadata) -> u64 {
@@ -705,18 +874,25 @@ pub(crate) fn remove_dir_all_retry(path: &Path) {
 /// A loaded, mmap'd index.
 pub struct Index {
     lookup: Mmap,
+    /// Cached entry count so binary search never re-reads the header.
+    lookup_count: usize,
     postings: Mmap,
     files: Mmap,
-    file_offsets: Vec<u32>,
+    /// Indexed root, stored in `files.dat`; joined onto stored relative
+    /// paths to reconstruct absolute paths.
+    root: PathBuf,
+    file_offsets: Vec<u64>,
     meta: Mmap,
-    meta_offsets: Vec<u32>,
+    meta_offsets: Vec<u64>,
 }
 
 impl Index {
     /// Load an index previously written by `build_index`.
     ///
     /// Validates the structural integrity of every file and returns an error
-    /// (never panics) if any of them is truncated or corrupted.
+    /// (never panics) if any of them is truncated or corrupted. An index
+    /// written by an older format version fails with `InvalidData`, which
+    /// callers can use to trigger a rebuild.
     pub fn open(index_dir: &Path) -> std::io::Result<Index> {
         let lf = File::open(index_dir.join("lookup.dat"))?;
         let pf = File::open(index_dir.join("postings.dat"))?;
@@ -733,40 +909,42 @@ impl Index {
         check_header(&meta, META_HEADER)?;
 
         let lookup_count = read_u64(&lookup, COUNT_OFFSET)? as usize;
-        if lookup.len() < HEADER_LEN + lookup_count * ENTRY_LEN {
+        if lookup.len() < HEADER_LEN + lookup_count * LOOKUP_ENTRY_LEN {
             return Err(corrupt("lookup table truncated"));
         }
 
         let postings_distinct = read_u64(&postings, COUNT_OFFSET)? as usize;
         let postings_total_ids = read_u64(&postings, COUNT_OFFSET + 8)? as usize;
-        let expected_postings_len = POSTINGS_DATA_OFFSET
-            .checked_add(
-                (postings_distinct as u64)
-                    .checked_mul(4)
-                    .ok_or_else(|| corrupt("overflow"))?,
-            )
-            .and_then(|v| v.checked_add((postings_total_ids as u64).checked_mul(4)?))
-            .ok_or_else(|| corrupt("overflow"))?;
-        if (postings.len() as u64) < expected_postings_len {
-            return Err(corrupt("posting list truncated"));
+        if postings.len() < POSTINGS_DATA_OFFSET as usize {
+            return Err(corrupt("posting table truncated"));
+        }
+        if postings_distinct != lookup_count || postings_total_ids < postings_distinct {
+            return Err(corrupt("posting/lookup counts disagree"));
         }
 
         if lookup_count > 0 {
-            let first_off = read_u64(&lookup, HEADER_LEN + 8)? as usize;
-            let last_off =
-                read_u64(&lookup, HEADER_LEN + (lookup_count - 1) * ENTRY_LEN + 8)? as usize;
+            let first_off = u40_at(&lookup, HEADER_LEN + 5)
+                .ok_or_else(|| corrupt("lookup table truncated"))?
+                as usize;
+            let last_off = u40_at(
+                &lookup,
+                HEADER_LEN + (lookup_count - 1) * LOOKUP_ENTRY_LEN + 5,
+            )
+            .ok_or_else(|| corrupt("lookup table truncated"))? as usize;
             if first_off < POSTINGS_DATA_OFFSET as usize || last_off >= postings.len() {
                 return Err(corrupt("posting list offset out of range"));
             }
         }
 
-        let file_offsets = read_file_offsets(&files, FILES_HEADER)?;
-        let meta_offsets = read_meta_offsets(&meta, META_HEADER)?;
+        let (root, file_offsets) = read_file_offsets(&files)?;
+        let meta_offsets = read_meta_offsets(&meta)?;
 
         Ok(Index {
             lookup,
+            lookup_count,
             postings,
             files,
+            root,
             file_offsets,
             meta,
             meta_offsets,
@@ -788,19 +966,23 @@ impl Index {
         u64_at(&self.postings, COUNT_OFFSET + 8).unwrap_or(0)
     }
 
-    /// Absolute path of a file id.
-    pub fn file_path(&self, id: u32) -> Option<&Path> {
+    /// Absolute path of a file id (stored relative path joined onto the
+    /// indexed root).
+    pub fn file_path(&self, id: u32) -> Option<PathBuf> {
         let &p = self.file_offsets.get(id as usize)?;
         let plen = u64_at(&self.files, p as usize)? as usize;
         let bytes = self.files.get((p as usize + 8)..(p as usize + 8 + plen))?;
         #[cfg(unix)]
         {
             use std::os::unix::ffi::OsStrExt;
-            Some(Path::new(std::ffi::OsStr::from_bytes(bytes)))
+            Some(
+                self.root
+                    .join(Path::new(std::ffi::OsStr::from_bytes(bytes))),
+            )
         }
         #[cfg(not(unix))]
         {
-            std::str::from_utf8(bytes).ok().map(Path::new)
+            Some(self.root.join(std::str::from_utf8(bytes).ok()?))
         }
     }
 
@@ -820,19 +1002,23 @@ impl Index {
     /// Safe against malformed files: out-of-range data yields an empty list.
     pub fn postings_into(&self, hash: u64, out: &mut Vec<u32>) {
         out.clear();
-        let Some(offset) = lookup_offset(&self.lookup, hash) else {
+        let Some(offset) = self.lookup_offset(hash) else {
             return;
         };
-        let offset = offset as usize;
-        let Some(list_len) = u32_at(&self.postings, offset) else {
+        let mut pos = offset as usize;
+        let Some(list_len) = read_varint(&self.postings, &mut pos) else {
             return;
         };
-        let list_len = list_len as usize;
-        out.reserve(list_len);
-        let ids_start = offset + 4;
-        for i in 0..list_len {
-            match u32_at(&self.postings, ids_start + i * 4) {
-                Some(id) => out.push(id),
+        // A posting list can never exceed the number of indexed files; cap
+        // the reservation so a corrupt count cannot spike memory.
+        out.reserve((list_len as usize).min(self.file_count().max(1)));
+        let mut prev = 0u64;
+        for _ in 0..list_len {
+            match read_varint(&self.postings, &mut pos) {
+                Some(delta) => {
+                    prev += delta;
+                    out.push(prev as u32);
+                }
                 None => {
                     out.clear();
                     return;
@@ -850,35 +1036,34 @@ impl Index {
 
     /// True when `hash` exists in the lookup table.
     pub fn has_ngram(&self, hash: u64) -> bool {
-        lookup_offset(&self.lookup, hash).is_some()
+        self.lookup_offset(hash).is_some()
     }
-}
 
-/// Binary search the sorted lookup table for `hash`, returning its
-/// absolute `postings.dat` offset when present.
-fn lookup_offset(lookup: &Mmap, hash: u64) -> Option<u64> {
-    let count = u64_at(lookup, COUNT_OFFSET)? as usize;
-    let base = HEADER_LEN;
-    let mut lo = 0usize;
-    let mut hi = count;
-    while lo < hi {
-        let mid = (lo + hi) / 2;
-        let at = base + mid * ENTRY_LEN;
-        let h = u64_at(lookup, at)?;
-        if h < hash {
-            lo = mid + 1;
-        } else {
-            hi = mid;
+    /// Binary search the sorted lookup table for `hash`, returning its
+    /// absolute `postings.dat` offset when present.
+    fn lookup_offset(&self, hash: u64) -> Option<u64> {
+        let base = HEADER_LEN;
+        let mut lo = 0usize;
+        let mut hi = self.lookup_count;
+        while lo < hi {
+            let mid = (lo + hi) / 2;
+            let at = base + mid * LOOKUP_ENTRY_LEN;
+            let h = u40_at(&self.lookup, at)?;
+            if h < hash {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
         }
-    }
-    if lo < count {
-        let at = base + lo * ENTRY_LEN;
-        let h = u64_at(lookup, at)?;
-        if h == hash {
-            return u64_at(lookup, at + 8);
+        if lo < self.lookup_count {
+            let at = base + lo * LOOKUP_ENTRY_LEN;
+            let h = u40_at(&self.lookup, at)?;
+            if h == hash {
+                return u40_at(&self.lookup, at + 5);
+            }
         }
+        None
     }
-    None
 }
 
 fn check_header(data: &Mmap, magic: &[u8]) -> std::io::Result<()> {
@@ -902,19 +1087,28 @@ fn u64_at(data: &[u8], at: usize) -> Option<u64> {
         .map(u64::from_le_bytes)
 }
 
-fn u32_at(data: &[u8], at: usize) -> Option<u32> {
-    data.get(at..at + 4)
-        .and_then(|s| s.try_into().ok())
-        .map(u32::from_le_bytes)
-}
+/// Parse `files.dat`: returns the indexed root and per-file byte offsets of
+/// the length-prefixed relative paths.
+fn read_file_offsets(data: &Mmap) -> std::io::Result<(PathBuf, Vec<u64>)> {
+    check_header(data, FILES_HEADER)?;
+    let root_len = read_u64(data, COUNT_OFFSET)? as usize;
+    let count_at = HEADER_LEN + root_len;
+    if data.len() < count_at + 8 {
+        return Err(corrupt("file table truncated"));
+    }
+    let root_bytes = data
+        .get(HEADER_LEN..count_at)
+        .ok_or_else(|| corrupt("file table truncated"))?;
+    #[cfg(unix)]
+    let root = PathBuf::from(std::ffi::OsStr::from_bytes(root_bytes));
+    #[cfg(not(unix))]
+    let root = PathBuf::from(std::str::from_utf8(root_bytes).map_err(|_| corrupt("bad root")?));
 
-fn read_file_offsets(data: &Mmap, magic: &[u8]) -> std::io::Result<Vec<u32>> {
-    check_header(data, magic)?;
-    let count = read_u64(data, COUNT_OFFSET)? as usize;
+    let count = read_u64(data, count_at)? as usize;
     let mut out = Vec::with_capacity(count);
-    let mut p = HEADER_LEN;
+    let mut p = count_at + 8;
     for _ in 0..count {
-        out.push(p as u32);
+        out.push(p as u64);
         let plen = read_u64(data, p)? as usize;
         p = p
             .checked_add(8 + plen)
@@ -923,16 +1117,17 @@ fn read_file_offsets(data: &Mmap, magic: &[u8]) -> std::io::Result<Vec<u32>> {
             return Err(corrupt("file table truncated"));
         }
     }
-    Ok(out)
+    Ok((root, out))
 }
 
-fn read_meta_offsets(data: &Mmap, magic: &[u8]) -> std::io::Result<Vec<u32>> {
-    check_header(data, magic)?;
+/// Parse `meta.dat` into per-file byte offsets.
+fn read_meta_offsets(data: &Mmap) -> std::io::Result<Vec<u64>> {
+    check_header(data, META_HEADER)?;
     let count = read_u64(data, COUNT_OFFSET)? as usize;
     let mut out = Vec::with_capacity(count);
     let mut p = HEADER_LEN;
     for _ in 0..count {
-        out.push(p as u32);
+        out.push(p as u64);
         let plen = read_u64(data, p)? as usize;
         p = p
             .checked_add(24 + plen)
@@ -1041,6 +1236,43 @@ mod tests {
         let index = Index::open(&idx_dir).unwrap();
         assert_eq!(index.file_count(), 0);
         assert_eq!(index.ngram_count(), 0);
+    }
+
+    #[test]
+    fn binary_content_skipped_at_index_time() {
+        let root = tmpdir("binary-content");
+        fs::write(root.join("text.txt"), "readable text").unwrap();
+        // Text-looking extension but NUL bytes up front: the scanner no
+        // longer opens files for a content check, so indexing must skip it.
+        let mut fake_text = vec![0u8; 600];
+        fake_text.extend_from_slice(b"words after the nul region");
+        fs::write(root.join("fake.txt"), &fake_text).unwrap();
+
+        let idx_dir = root.join(".rgx");
+        let mut progress = |_: &str| {};
+        let stats = build_index(&root, &idx_dir, &ScanOptions::default(), &mut progress).unwrap();
+        assert_eq!(stats.files, 1, "binary content must be skipped");
+        let index = Index::open(&idx_dir).unwrap();
+        assert!(!index.file_path(0).unwrap().ends_with("fake.txt"));
+    }
+
+    #[test]
+    fn index_is_case_folded() {
+        let root = tmpdir("folded");
+        fs::write(root.join("a.txt"), "Hello World\n").unwrap();
+        let idx_dir = root.join(".rgx");
+        let mut progress = |_: &str| {};
+        build_index(&root, &idx_dir, &ScanOptions::default(), &mut progress).unwrap();
+        let index = Index::open(&idx_dir).unwrap();
+        for gram in
+            crate::ngram::covering_ngrams(b"hello world", crate::ngram::DEFAULT_MAX_NGRAM_LENGTH)
+        {
+            assert!(
+                index.has_ngram(ngram_hash(&gram)),
+                "folded gram {:?} missing from folded index",
+                String::from_utf8_lossy(&gram)
+            );
+        }
     }
 
     #[test]

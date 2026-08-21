@@ -20,7 +20,9 @@ pub struct Match {
 /// Scan `content` line by line, appending every matching line to `out`.
 ///
 /// Path is lazily wrapped in an `Arc<str>` on the first match in `content`,
-/// avoiding any heap allocation when the file does not match.
+/// avoiding any heap allocation when the file does not match. Line numbers
+/// are 1-based. In JSON mode submatch byte offsets are recorded; otherwise
+/// only a boolean per line is tested (faster).
 pub fn match_content_str(re: &Regex, content: &[u8], path: &str, json: bool, out: &mut Vec<Match>) {
     if !re.is_match(content) {
         return;
@@ -56,36 +58,6 @@ pub fn match_content_str(re: &Regex, content: &[u8], path: &str, json: bool, out
     }
 }
 
-/// Scan `content` line by line, appending every matching line to `out`.
-///
-/// Line numbers are 1-based. In JSON mode submatch byte offsets are recorded;
-/// otherwise only a boolean per line is tested (faster).
-pub fn match_content(re: &Regex, content: &[u8], path: Arc<str>, json: bool, out: &mut Vec<Match>) {
-    if !re.is_match(content) {
-        return;
-    }
-    for (line_no, line) in (1_u32..).zip(content.split(|&b| b == b'\n')) {
-        let subs = if json {
-            let v: Vec<(usize, usize)> = re.find_iter(line).map(|m| (m.start(), m.end())).collect();
-            if v.is_empty() {
-                continue;
-            }
-            v
-        } else {
-            if !re.is_match(line) {
-                continue;
-            }
-            Vec::new()
-        };
-        out.push(Match {
-            path: Arc::clone(&path),
-            line: line_no,
-            text: String::from_utf8_lossy(line).into_owned(),
-            submatches: subs,
-        });
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -97,10 +69,10 @@ mod tests {
     #[test]
     fn matches_lines_and_numbers() {
         let mut out = Vec::new();
-        match_content(
+        match_content_str(
             &re("hello"),
             b"hello world\nnothing here\noh hello again\n",
-            "f.txt".into(),
+            "f.txt",
             false,
             &mut out,
         );
@@ -114,7 +86,7 @@ mod tests {
     #[test]
     fn submatches_record_offsets() {
         let mut out = Vec::new();
-        match_content(&re("el+"), b"hello\n", "f.txt".into(), true, &mut out);
+        match_content_str(&re("el+"), b"hello\n", "f.txt", true, &mut out);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].submatches, vec![(1, 4)]);
     }
@@ -122,7 +94,7 @@ mod tests {
     #[test]
     fn empty_content_no_matches() {
         let mut out = Vec::new();
-        match_content(&re("x"), b"", "f.txt".into(), false, &mut out);
+        match_content_str(&re("x"), b"", "f.txt", false, &mut out);
         assert!(out.is_empty());
     }
 }

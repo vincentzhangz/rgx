@@ -7,7 +7,6 @@
 
 use ignore::WalkBuilder;
 use ignore::overrides::OverrideBuilder;
-use std::fs;
 use std::path::{Path, PathBuf};
 
 /// Default ignore rules for directories, matching instantgrep's defaults.
@@ -93,11 +92,27 @@ pub fn scan(root: &Path, opts: &ScanOptions) -> Vec<PathBuf> {
             Some(ft) => ft,
             None => continue,
         };
-        if (file_type.is_file() || (opts.follow_symlinks && file_type.is_symlink()))
-            && indexable_file(path, opts)
-        {
-            files.push(path.to_path_buf());
+        if !(file_type.is_file() || (opts.follow_symlinks && file_type.is_symlink())) {
+            continue;
         }
+        // Reuse the walker's stat result; no extra syscall per file.
+        let Ok(meta) = entry.metadata() else {
+            continue;
+        };
+        if meta.len() == 0 || meta.len() > opts.max_file_size {
+            continue;
+        }
+        if is_hidden(path) {
+            continue;
+        }
+        if let Some(ext) = path.extension().and_then(|e| e.to_str())
+            && BINARY_EXTENSIONS
+                .iter()
+                .any(|&b| ext.eq_ignore_ascii_case(b))
+        {
+            continue;
+        }
+        files.push(path.to_path_buf());
     }
     files.sort();
     files
@@ -130,44 +145,19 @@ fn is_hidden(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
-fn indexable_file(path: &Path, opts: &ScanOptions) -> bool {
-    if is_hidden(path) {
-        return false;
-    }
-    if let Some(ext) = path.extension().and_then(|e| e.to_str())
-        && BINARY_EXTENSIONS
-            .iter()
-            .any(|&b| ext.eq_ignore_ascii_case(b))
-    {
-        return false;
-    }
-    match fs::metadata(path) {
-        Ok(m) => {
-            if m.len() == 0 || m.len() > opts.max_file_size {
-                return false;
-            }
-        }
-        Err(_) => return false,
-    }
-    !contains_nul_byte(path)
-}
-
-fn contains_nul_byte(path: &Path) -> bool {
-    let f = match fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return true,
-    };
-    use std::io::Read;
-    let mut buf = [0u8; 512];
-    let mut f = f;
-    let n = f.read(&mut buf).unwrap_or(0);
-    buf[..n].contains(&0)
+/// True when `content` looks binary: a NUL byte within the first 512 bytes.
+/// Callers that read file content anyway (indexing, brute-force matching)
+/// apply this after reading, so the scanner never opens files twice.
+pub fn is_binary_content(content: &[u8]) -> bool {
+    let head = &content[..content.len().min(512)];
+    head.contains(&0)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::index::remove_dir_all_retry;
+    use std::fs;
 
     fn tmpdir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("rgx-scan-test-{name}-{}", std::process::id()));
@@ -181,15 +171,24 @@ mod tests {
         let root = tmpdir("policy");
         fs::write(root.join("a.txt"), "hello").unwrap();
         fs::write(root.join(".hidden.txt"), "hello").unwrap();
-        fs::write(root.join("bin.dat"), [1, 2, 0, 3]).unwrap();
+        fs::write(root.join("blob.png"), "hello").unwrap();
+        fs::write(root.join("nul.txt"), [1, 2, 0, 3]).unwrap();
         fs::create_dir_all(root.join(".git")).unwrap();
         fs::write(root.join(".git/config"), "hello").unwrap();
         fs::create_dir_all(root.join("node_modules")).unwrap();
         fs::write(root.join("node_modules/dep.js"), "hello").unwrap();
 
+        // Content-based binary detection (NUL bytes) happens when the file
+        // is read for indexing, not during the walk; extension-based
+        // filtering still happens here.
         let files = scan(&root, &ScanOptions::default());
         let canon_root = display_root(&root);
-        assert_eq!(files, vec![canon_root.join("a.txt")]);
+        assert_eq!(
+            files,
+            vec![canon_root.join("a.txt"), canon_root.join("nul.txt")]
+        );
+        assert!(is_binary_content(&[1, 2, 0, 3]));
+        assert!(!is_binary_content(b"plain text"));
     }
 
     #[test]
